@@ -1,0 +1,157 @@
+/*
+ * Visual language taken from the mock-ups in materials/:
+ * dark navy panels, thick black outlines, yellow = player 1, pink = player 2,
+ * chunky pixel font, angled frame corners, sunset backdrop.
+ */
+:root {
+  --ink: #120a24;
+  --panel: #1a1238;
+  --panel-2: #241a4d;
+  --p1: #ffd21f;
+  --p1-deep: #f2a50c;
+  --p2: #ff2e9a;
+  --p2-deep: #c2167a;
+  --cyan: #5ad8ff;
+  --text: #ffffff;
+  --muted: #b6a9e6;
+  --danger: #ff5a5a;
+  --font: 'Press Start 2P', system-ui, sans-serif;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: #07040f;
+  color: var(--text);
+  font-family: var(--font);
+  overflow: hidden;
+  -webkit-font-smoothing: none;
+  user-select: none;
+}
+
+#app {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+}
+
+/* 16:9 stage, scaled to fit; all UI sizes use container units (cqw) */
+.stage {
+  position: relative;
+  width: min(100vw, 177.78vh);
+  aspect-ratio: 16 / 9;
+  container-type: size;
+  overflow: hidden;
+  background: linear-gradient(180deg, #2b2a6b 0%, #8a4a9c 40%, #f07a7a 68%, #ffb36b 80%, #5b4c9a 80.5%, #2a2350 100%);
+  background-size: cover;
+  background-position: center bottom;
+  font-size: 1.05cqw;
+}
+
+.screen {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.dim::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: rgba(10, 6, 28, 0.55);
+  pointer-events: none;
+}
+
+/* angled panel like the mock-up frames */
+.panel {
+  position: relative;
+  background: var(--panel);
+  border: 0.3cqw solid var(--ink);
+  box-shadow: inset 0 0 0 0.25cqw rgba(255, 255, 255, 0.08);
+}
+
+.title {
+  font-size: 3.4cqw;
+  color: var(--p1);
+  text-shadow:
+    0.25cqw 0.25cqw 0 var(--p2),
+    0.5cqw 0.5cqw 0 var(--ink);
+  letter-spacing: 0.1cqw;
+  text-align: center;
+  line-height: 1.25;
+}
+
+.btn {
+  font-family: var(--font);
+  font-size: 1.15cqw;
+  color: var(--ink);
+  background: var(--p1);
+  border: 0.25cqw solid var(--ink);
+  padding: 1cqw 2.2cqw;
+  cursor: pointer;
+  box-shadow: inset 0 -0.35cqw 0 var(--p1-deep);
+  transition:
+    transform 0.08s ease,
+    filter 0.08s ease;
+  min-width: 18cqw;
+  text-transform: uppercase;
+}
+
+.btn.pink {
+  background: var(--p2);
+  color: var(--text);
+  box-shadow: inset 0 -0.35cqw 0 var(--p2-deep);
+}
+
+.btn.ghost {
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: inset 0 -0.35cqw 0 #120a24;
+}
+
+.btn:hover,
+.btn.focused {
+  transform: translateX(0.4cqw) scale(1.04);
+  filter: brightness(1.12);
+  outline: 0.25cqw solid var(--text);
+  outline-offset: 0.2cqw;
+}
+
+.btn:active {
+  transform: scale(0.97);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.hint {
+  font-size: 0.75cqw;
+  color: var(--muted);
+  line-height: 1.8;
+  text-align: center;
+}
+
+.p1-color {
+  color: var(--p1);
+}
+
+.p2-color {
+  color: var(--p2);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn {
+    transition: none;
+  }
+}
