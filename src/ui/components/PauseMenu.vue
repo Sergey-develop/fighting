@@ -7,7 +7,11 @@ import { useMenuInput } from '../use-menu-input'
 import ButtonPrompt from './ButtonPrompt.vue'
 import LightningBolt from './LightningBolt.vue'
 
-const props = defineProps<{ disconnected: [boolean, boolean] }>()
+const props = defineProps<{
+  disconnected: [boolean, boolean]
+  /** online: the match keeps running behind the menu and can't be restarted */
+  online?: boolean
+}>()
 const emit = defineEmits<{
   resume: []
   restart: []
@@ -15,11 +19,18 @@ const emit = defineEmits<{
 }>()
 
 const missing = computed(() => props.disconnected.findIndex((d) => d))
-const items = computed(() => [
-  { label: 'Continue', run: () => emit('resume'), disabled: missing.value >= 0 },
-  { label: 'Restart', run: () => emit('restart'), disabled: false },
-  { label: 'Exit', run: () => emit('quit'), disabled: false },
-])
+const items = computed(() =>
+  props.online
+    ? [
+        { label: 'Continue', run: () => emit('resume'), disabled: false },
+        { label: 'Exit', run: () => emit('quit'), disabled: false },
+      ]
+    : [
+        { label: 'Continue', run: () => emit('resume'), disabled: missing.value >= 0 },
+        { label: 'Restart', run: () => emit('restart'), disabled: false },
+        { label: 'Exit', run: () => emit('quit'), disabled: false },
+      ],
+)
 const focus = ref(0)
 /** prompts follow the device that was pressed last */
 const promptStyle = ref<PromptStyle>(inputManager.promptStyle)

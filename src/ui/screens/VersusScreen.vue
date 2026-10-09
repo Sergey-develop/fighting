@@ -6,6 +6,7 @@ import { getFighter } from '@/game/fighters/registry'
 import { hasMenu } from '@/game/input/actions'
 import FighterPreview from '../components/FighterPreview.vue'
 import PixelNumber from '../components/PixelNumber.vue'
+import { net } from '@/game/net/connection'
 import { app, go } from '../store'
 import { useMenuInput } from '../use-menu-input'
 
@@ -15,7 +16,9 @@ const INTRO_MS = 1200
 const STEP_MS = 1000
 const COUNT_FROM = 3
 
+const isOnline = app.mode === 'online'
 const labels: [string, string] = app.mode === 'ai' ? ['PLAYER 1', 'AI'] : ['PLAYER 1', 'PLAYER 2']
+if (isOnline) labels[net.localSlot] += ' · ВЫ'
 const defs = [getFighter(app.selection[0]), getFighter(app.selection[1])] as const
 
 /** 0 = countdown not started yet */
@@ -49,13 +52,14 @@ onMounted(() => {
 
 onBeforeUnmount(() => window.clearTimeout(timer))
 
+// online both sides must reach the fight together, so the intro can't be skipped
 useMenuInput(({ any }) => {
-  if (hasMenu(any, 'confirm')) proceed()
+  if (!isOnline && hasMenu(any, 'confirm')) proceed()
 })
 </script>
 
 <template>
-  <div class="screen versus" @click="proceed">
+  <div class="screen versus" @click="!isOnline && proceed()">
     <div v-for="slot in PLAYER_SLOTS" :key="slot" class="side" :class="slot === 0 ? 'p1' : 'p2'">
       <div class="tag">{{ labels[slot] }}</div>
       <div class="sprite">
@@ -67,7 +71,7 @@ useMenuInput(({ any }) => {
     <div class="slash" />
     <div class="vs title">VS</div>
     <div v-if="count > 0" :key="count" class="count"><PixelNumber :value="count" /></div>
-    <p class="hint skip">Enter / A — пропустить</p>
+    <p v-if="!isOnline" class="hint skip">Enter / A — пропустить</p>
   </div>
 </template>
 

@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { audioManager } from '@/game/audio/audio-manager'
 import { hasMenu } from '@/game/input/actions'
 import { LOCATIONS, isLocationLocked, sceneImageUrl, type LocationDefinition } from '@/game/locations/locations'
-import { app, go } from '../store'
+import { net } from '@/game/net/connection'
+import { app, go, hostStartMatch, online, onlineBackToSelect } from '../store'
 import { useMenuInput } from '../use-menu-input'
 
 const n = LOCATIONS.length
@@ -17,6 +18,24 @@ const dir = ref<1 | -1>(1)
 const chosen = ref(false)
 let leaveTimer = 0
 onBeforeUnmount(() => window.clearTimeout(leaveTimer))
+
+/** online: the host picks the arena, the guest watches the carousel */
+const isOnline = app.mode === 'online'
+const spectating = isOnline && online.role === 'guest'
+if (isOnline && !spectating) watch(focus, (i) => net.send({ t: 'loc', i }), { immediate: true })
+if (spectating) {
+  watch(
+    () => online.remoteLocation,
+    (i) => {
+      if (i === focus.value || i < 0 || i >= n) return
+      const forward = (((i - focus.value) % n) + n) % n
+      dir.value = forward <= n / 2 ? 1 : -1
+      focus.value = i
+      audioManager.play('ui-move')
+    },
+    { immediate: true },
+  )
+}
 
 /** lightning frame drawn over every location card (border.png) */
 const FRAME_ART = `${import.meta.env.BASE_URL}assets/ui/location-frame.webp`
@@ -34,7 +53,7 @@ const current = computed(() => at(0))
 const sides = computed(() => ({ left: [at(-2), at(-1)], right: [at(1), at(2)] }))
 
 function move(step: 1 | -1): void {
-  if (chosen.value) return
+  if (chosen.value || spectating) return
   dir.value = step
   focus.value = (((focus.value + step) % n) + n) % n
   audioManager.play('ui-move')
@@ -42,7 +61,7 @@ function move(step: 1 | -1): void {
 
 function pick(l: LocationDefinition): void {
   const i = LOCATIONS.indexOf(l)
-  if (chosen.value) return
+  if (chosen.value || spectating) return
   if (i >= 0 && i !== focus.value) {
     // shortest way round the carousel decides the slide direction
     const forward = (((i - focus.value) % n) + n) % n
@@ -53,6 +72,7 @@ function pick(l: LocationDefinition): void {
 }
 
 function confirm(): void {
+  if (spectating) return
   const l = current.value
   if (isLocationLocked(l)) {
     denied.value++
@@ -64,13 +84,14 @@ function confirm(): void {
   audioManager.play('ui-confirm')
   chosen.value = true
   // let the "chosen" flash play before the VS screen
-  leaveTimer = window.setTimeout(() => go('versus'), 420)
+  leaveTimer = window.setTimeout(() => (isOnline ? hostStartMatch() : go('versus')), 420)
 }
 
 function back(): void {
   if (chosen.value) return
   audioManager.play('ui-back')
-  go('select')
+  if (isOnline) onlineBackToSelect()
+  else go('select')
 }
 
 useMenuInput(({ any }) => {
@@ -142,18 +163,23 @@ useMenuInput(({ any }) => {
       </div>
     </div>
 
-    <div class="actions">
+    <p v-if="spectating" class="hint waiting">Соперник выбирает локацию...</p>
+    <div v-else class="actions">
       <button class="arrow" aria-label="Предыдущая" @click="move(-1)">◀</button>
       <button class="btn pink" :disabled="isLocationLocked(current)" @click="confirm">
         {{ isLocationLocked(current) ? 'Закрыто' : 'Выбрать' }}
       </button>
       <button class="arrow" aria-label="Следующая" @click="move(1)">▶</button>
     </div>
-    <button class="btn ghost back" @click="back">Назад</button>
+    <button v-if="!spectating" class="btn ghost back" @click="back">Назад</button>
   </div>
 </template>
 
 <style scoped>
+.waiting {
+  position: relative;
+  font-size: 1cqw;
+}
 .locations {
   justify-content: center;
   gap: 1.6cqw;

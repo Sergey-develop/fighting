@@ -9,6 +9,8 @@ import { EventQueue } from './core/events'
 import { FixedLoop } from './core/loop'
 import { PLAYER_SLOTS, type PlayerSlot } from './core/types'
 import { getFighter, validateFighter } from './fighters/registry'
+import type { NetConnection } from './net/connection'
+import { CHECKSUM_INTERVAL, Lockstep } from './net/lockstep'
 import { ACTION_BIT, createInputFrame, type InputFrame } from './input/actions'
 import type { InputManager } from './input/input-manager'
 import { AnyDeviceInputSource, DeviceInputSource, type InputSource } from './input/sources'
@@ -17,7 +19,7 @@ import { Renderer } from './render/renderer'
 import { Match, type MatchPhase } from './rounds/match'
 import { VfxSystem } from './vfx/vfx'
 
-export type GameMode = 'versus' | 'ai'
+export type GameMode = 'versus' | 'ai' | 'online'
 
 export interface FightSetup {
   mode: GameMode
@@ -26,6 +28,16 @@ export interface FightSetup {
   showHitboxes: boolean
   /** arena background image (null = gradient) */
   stageImage: string | null
+  /** online match: the opponent's seat is driven by the network */
+  online?: {
+    link: NetConnection
+    /** this browser's seat */
+    localSlot: PlayerSlot
+    /** serial of the match within the connection (both sides count the same) */
+    matchId: number
+    /** input delay, ticks (chosen by the host) */
+    delay: number
+  }
 }
 
 export interface MatchSummary {
@@ -34,6 +46,11 @@ export interface MatchSummary {
   fighters: [string, string]
   mode: GameMode
 }
+
+/** Below this pace the clocks of the two sides are pulled together (online). */
+const NET_SLOWDOWN = 0.96
+/** Frames without the opponent's input before "waiting" is shown. */
+const NET_WAIT_FRAMES = 20
 
 /** Ticks the MATCH_END banner stays before the result screen. */
 const MATCH_END_HOLD = 90
@@ -59,6 +76,10 @@ export class FightSession {
   private readonly ai: AiController | null
   private readonly inputs: [InputFrame, InputFrame] = [createInputFrame(), createInputFrame()]
   private readonly pauseProbe: InputFrame = createInputFrame()
+  private readonly lockstep: Lockstep | null
+  /** local input sampled for the online lockstep */
+  private readonly sampled: InputFrame = createInputFrame()
+  private stallFrames = 0
   private tick = 0
   private lastPhaseSerial = -1
   private matchEndTicks = 0
@@ -93,12 +114,22 @@ export class FightSession {
     this.renderer = new Renderer(canvas, atlases, setup.stageImage)
     this.renderer.options.showHitboxes = setup.showHitboxes
     this.ai = setup.mode === 'ai' ? new AiController(b, a) : null
+    const online = setup.online
+    this.lockstep = online ? new Lockstep(online.link, online.localSlot, online.matchId, online.delay) : null
     this.sources = this.ai
       ? [new AnyDeviceInputSource(input, 0), this.ai]
-      : [new DeviceInputSource(input, 0), new DeviceInputSource(input, 1)]
+      : online
+        ? // online each side plays with player 1's controls (keyboard + any gamepad)
+          [new AnyDeviceInputSource(input, 0), new AnyDeviceInputSource(input, 0)]
+        : [new DeviceInputSource(input, 0), new DeviceInputSource(input, 1)]
+    if (online && this.lockstep) {
+      const ls = this.lockstep
+      online.link.setGameHandler((m) => ls.receive(m))
+    }
     this.loop = new FixedLoop({
       beginFrame: () => this.beginFrame(),
       step: () => this.step(),
+      canStep: this.lockstep ? () => this.lockstep?.ready(this.tick) ?? true : undefined,
       render: (alpha) => this.render(alpha),
     })
     const s = this.hud.snapshot
@@ -121,6 +152,17 @@ export class FightSession {
   destroy(): void {
     this.loop.stop()
     this.onMatchEnd = null
+    this.setup.online?.link.setGameHandler(null)
+  }
+
+  /** Online: the opponent's input is late and the game is waiting for it. */
+  get netWaiting(): boolean {
+    return this.stallFrames >= NET_WAIT_FRAMES
+  }
+
+  /** Online: state checksums of the two sides differed. */
+  get desynced(): boolean {
+    return this.lockstep?.desynced ?? false
   }
 
   setPaused(paused: boolean): void {
@@ -134,6 +176,12 @@ export class FightSession {
 
   private updatePause(): void {
     const s = this.hud.snapshot
+    if (this.lockstep) {
+      // online the match never stops: the menu only mutes this player's input
+      this.loop.paused = false
+      s.paused = this.userPaused
+      return
+    }
     const disconnected = s.disconnected[0] || s.disconnected[1]
     this.loop.paused = this.userPaused || disconnected
     s.paused = this.loop.paused
@@ -154,6 +202,16 @@ export class FightSession {
   }
 
   private beginFrame(): void {
+    if (this.lockstep) {
+      this.stallFrames = this.lockstep.ready(this.tick) ? 0 : this.stallFrames + 1
+      // while the menu is open, the Vue pause menu owns input polling
+      if (this.userPaused) return
+      this.input.poll()
+      this.input.readPlayerAnyDevice(0, this.pauseProbe)
+      if (this.pauseProbe.pressed & ACTION_BIT.pause && !this.finished) this.userPaused = true
+      this.updatePause()
+      return
+    }
     if (this.loop.paused) {
       // while paused the Vue pause menu owns input polling
       this.updateDisconnected()
@@ -175,10 +233,24 @@ export class FightSession {
   }
 
   private step(): void {
-    this.ai?.observe()
-    this.sources[0].readTick(this.inputs[0])
-    this.sources[1].readTick(this.inputs[1])
-    this.input.endTick()
+    if (this.lockstep) {
+      const smp = this.sampled
+      if (this.userPaused) {
+        smp.held = 0
+        smp.pressed = 0
+      } else {
+        this.sources[this.lockstep.localSlot].readTick(smp)
+        this.input.endTick()
+      }
+      smp.held &= ~ACTION_BIT.pause
+      smp.pressed &= ~ACTION_BIT.pause
+      this.lockstep.advance(this.tick, smp, this.inputs)
+    } else {
+      this.ai?.observe()
+      this.sources[0].readTick(this.inputs[0])
+      this.sources[1].readTick(this.inputs[1])
+      this.input.endTick()
+    }
 
     this.events.clear()
     this.combat.step(this.inputs, this.tick)
@@ -193,7 +265,31 @@ export class FightSession {
     this.handleEvents()
     this.handlePhase()
     this.loop.timeScale = this.match.timeScale
+    if (this.lockstep) {
+      if (this.tick % CHECKSUM_INTERVAL === 0) this.lockstep.checksum(this.tick, this.checksum())
+      // running ahead of the opponent: ease off instead of stalling in bursts
+      if (this.lockstep.advantage(this.tick) > 1.5) this.loop.timeScale *= NET_SLOWDOWN
+    }
     this.tick++
+  }
+
+  /** Cheap hash of the simulation state, compared between the two sides. */
+  private checksum(): number {
+    let h = 0x811c9dc5
+    const mix = (v: number): void => {
+      h = Math.imul(h ^ (v | 0), 16777619)
+    }
+    for (const f of this.fighters) {
+      mix(Math.round(f.x * 100))
+      mix(Math.round(f.y * 100))
+      mix(Math.round(f.hp * 100))
+      mix(Math.round(f.energy * 100))
+      mix(f.stateFrame)
+    }
+    mix(this.match.timerTicks)
+    mix(this.match.round)
+    mix(this.match.phaseFrame)
+    return h >>> 0
   }
 
   private handleEvents(): void {

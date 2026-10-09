@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { fighterAssetUrl } from '@/game/assets/atlas'
 import { audioManager } from '@/game/audio/audio-manager'
 import { PLAYER_SLOTS, otherSlot, type PlayerSlot } from '@/game/core/types'
@@ -8,9 +8,10 @@ import type { FighterDefinition, FighterProfileText } from '@/game/fighters/type
 import { hasMenu } from '@/game/input/actions'
 import { inputManager } from '@/game/input/input-manager'
 import { gamepadCodeLabel, keyCodeLabel, type DeviceRef } from '@/game/input/bindings'
+import { net } from '@/game/net/connection'
 import FighterPreview from '../components/FighterPreview.vue'
 import ShapePlate from '../components/ShapePlate.vue'
-import { app, go, openOptions, saveControls } from '../store'
+import { app, go, leaveOnline, online, openOptions, saveControls } from '../store'
 import { useMenuInput } from '../use-menu-input'
 
 interface SeatState {
@@ -19,6 +20,10 @@ interface SeatState {
 }
 
 const vsAi = app.mode === 'ai'
+/** online: this browser controls one seat, the other one mirrors the opponent */
+const isOnline = app.mode === 'online'
+const me: PlayerSlot = isOnline ? net.localSlot : 0
+const them: PlayerSlot = otherSlot(me)
 const seats = reactive<[SeatState, SeatState]>([
   { cursor: Math.max(0, rosterIndexOf(app.selection[0])), ready: false },
   { cursor: Math.max(0, rosterIndexOf(app.selection[1])), ready: false },
@@ -31,7 +36,7 @@ const deviceTick = ref(0)
  * Versus: seats are taken in press order every time this screen opens —
  * the first device to press anything becomes player 1, the next one player 2.
  */
-const claimed = reactive<[boolean, boolean]>([vsAi, vsAi])
+const claimed = reactive<[boolean, boolean]>([vsAi || isOnline, vsAi || isOnline])
 const unsubscribe = inputManager.onDevicesChanged(() => deviceTick.value++)
 onBeforeUnmount(unsubscribe)
 let startTimer = 0
@@ -75,7 +80,7 @@ function fighterAt(slot: PlayerSlot): FighterDefinition | null {
 
 function connected(slot: PlayerSlot): boolean {
   void deviceTick.value
-  if (vsAi) return true
+  if (vsAi || isOnline) return true
   return claimed[slot] && inputManager.isSeatConnected(slot)
 }
 
@@ -83,6 +88,7 @@ function deviceLabel(slot: PlayerSlot): string {
   void deviceTick.value
   if (vsAi && slot === 1) return 'AI'
   if (vsAi) return 'Клавиатура + геймпад'
+  if (isOnline) return slot === me ? 'Вы' : `Соперник · пинг ${online.ping} мс`
   const d: DeviceRef = inputManager.controls.players[slot].device
   if (d.kind === 'keyboard') return slot === 0 ? 'Клавиатура (WASD)' : 'Клавиатура (стрелки)'
   if (d.kind === 'gamepad') return `Геймпад ${d.index + 1}`
@@ -90,6 +96,29 @@ function deviceLabel(slot: PlayerSlot): string {
 }
 
 const bothReady = computed(() => seats[0].ready && seats[1].ready)
+
+if (isOnline) {
+  // our seat → opponent
+  watch(
+    () => [seats[me].cursor, seats[me].ready] as const,
+    ([cursor, ready]) => net.send({ t: 'seat', cursor, ready }),
+    { immediate: true },
+  )
+  // opponent → their seat
+  watch(
+    () => [online.remoteCursor, online.remoteReady] as const,
+    ([cursor, ready]) => {
+      const s = seats[them]
+      if (s.cursor !== cursor) audioManager.play('ui-move')
+      if (ready !== s.ready) audioManager.play(ready ? 'ui-confirm' : 'ui-back')
+      s.cursor = cursor
+      s.ready = ready
+      window.clearTimeout(startTimer)
+      if (bothReady.value) startTimer = window.setTimeout(startFight, LOCK_IN_MS)
+    },
+    { immediate: true },
+  )
+}
 
 function move(slot: PlayerSlot, dx: number, dy: number): void {
   const s = seats[slot]
@@ -119,6 +148,7 @@ function confirm(slot: PlayerSlot): void {
     return
   }
   if (s.ready) return
+  if (isOnline && slot !== me) return
   if (!fighterAt(slot)) {
     // locked slot: cannot be picked yet
     denied[slot]++
@@ -195,6 +225,7 @@ function back(slot: PlayerSlot): void {
     go('menu')
     return
   }
+  if (isOnline && slot !== me) return
   const s = seats[slot]
   if (s.ready) {
     s.ready = false
@@ -202,7 +233,8 @@ function back(slot: PlayerSlot): void {
     return
   }
   audioManager.play('ui-back')
-  go('menu')
+  if (isOnline) leaveOnline()
+  else go('menu')
 }
 
 function startFight(): void {
@@ -230,8 +262,9 @@ function assign(slot: PlayerSlot, device: DeviceRef): void {
 /** Short key hint for a seat, e.g. "A W D · J K L U I". */
 function keysHint(slot: PlayerSlot): string {
   void deviceTick.value
-  const pc = inputManager.controls.players[slot]
-  if (vsAi) return ''
+  if (vsAi || (isOnline && slot !== me)) return ''
+  // online every player uses player 1's controls
+  const pc = inputManager.controls.players[isOnline ? 0 : slot]
   if (pc.device.kind === 'keyboard') {
     const k = (codes: readonly string[]): string => (codes[0] ? keyCodeLabel(codes[0]) : '—')
     const kb = pc.keyboard
@@ -247,7 +280,7 @@ function keysHint(slot: PlayerSlot): string {
 
 /** Exchange the two seats' devices (e.g. keyboard ↔ gamepad). */
 function swapDevices(): void {
-  if (vsAi || seats[0].ready || seats[1].ready) return
+  if (vsAi || isOnline || seats[0].ready || seats[1].ready) return
   const [p1, p2] = inputManager.controls.players
   const d = p1.device
   p1.device = p2.device
@@ -329,6 +362,10 @@ function claimSeat(): boolean {
 }
 
 useMenuInput(({ any, players }) => {
+  if (isOnline) {
+    handleSeat(me, any)
+    return
+  }
   if (vsAi) {
     // single human: keyboard and every gamepad control player 1 together
     handleSeat(0, any)
@@ -342,6 +379,12 @@ useMenuInput(({ any, players }) => {
   }
   for (const slot of PLAYER_SLOTS) if (claimed[slot]) handleSeat(slot, players[slot])
 })
+
+function seatTag(slot: PlayerSlot): string {
+  if (vsAi && slot === 1) return 'AI'
+  if (isOnline) return slot === me ? 'ВЫ' : 'СОПЕРНИК'
+  return `PLAYER ${slot + 1}`
+}
 
 /** player colour (yellow / pink, as in the mock-up) */
 function accent(slot: PlayerSlot): string {
@@ -390,6 +433,7 @@ function portrait(def: FighterDefinition): string {
 
 function clickFighter(slot: PlayerSlot, i: number): void {
   if (vsAi && slot === 1) return // the AI picks for itself
+  if (isOnline && slot !== me) return
   if (seats[slot].ready) return
   seats[slot].cursor = i
   audioManager.play('ui-move')
@@ -476,7 +520,7 @@ function clickFighter(slot: PlayerSlot, i: number): void {
       </div>
 
       <ShapePlate shape="tag" class="player-tag" fill="#141033" :stroke="accent(slot)" :flip="slot === 1">
-        <span class="tag-text" :style="{ color: accent(slot) }">{{ vsAi && slot === 1 ? 'AI' : `PLAYER ${slot + 1}` }}</span>
+        <span class="tag-text" :style="{ color: accent(slot) }">{{ seatTag(slot) }}</span>
       </ShapePlate>
 
       <template v-if="connected(slot)">
@@ -503,7 +547,7 @@ function clickFighter(slot: PlayerSlot, i: number): void {
           <button
             class="pick-btn"
             :class="slot === 0 ? 'p1' : 'p2'"
-            :disabled="(vsAi && slot === 1) || (!seats[slot].ready && !fighterAt(slot))"
+            :disabled="(vsAi && slot === 1) || (isOnline && slot !== me) || (!seats[slot].ready && !fighterAt(slot))"
             @click="seats[slot].ready ? back(slot) : confirm(slot)"
           >
             <img class="pick-art" :src="BUTTON_ART" alt="" draggable="false" />
@@ -524,7 +568,7 @@ function clickFighter(slot: PlayerSlot, i: number): void {
       </svg>
     </div>
     <button
-      v-if="!vsAi"
+      v-if="!vsAi && !isOnline"
       class="swap"
       title="Поменять устройства игроков местами"
       :disabled="seats[0].ready || seats[1].ready"
@@ -540,7 +584,7 @@ function clickFighter(slot: PlayerSlot, i: number): void {
       </svg>
       <span class="vs-text">VS</span>
     </div>
-    <button class="back" @click="go('menu')">← Назад</button>
+    <button class="back" @click="isOnline ? leaveOnline() : go('menu')">← Назад</button>
   </div>
 </template>
 

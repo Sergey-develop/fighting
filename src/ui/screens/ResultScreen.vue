@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { fighterAssetUrl } from '@/game/assets/atlas'
 import { audioManager } from '@/game/audio/audio-manager'
 import { PLAYER_SLOTS, type PlayerSlot } from '@/game/core/types'
@@ -7,21 +7,40 @@ import { getFighter } from '@/game/fighters/registry'
 import { hasMenu } from '@/game/input/actions'
 import FighterPreview from '../components/FighterPreview.vue'
 import PixelNumber from '../components/PixelNumber.vue'
-import { app, go, statistics } from '../store'
+import { net } from '@/game/net/connection'
+import { app, go, leaveOnline, online, onlineBackToSelect, requestRematch, statistics } from '../store'
 import { useMenuInput } from '../use-menu-input'
 
 const result = app.lastResult
+const isOnline = app.mode === 'online'
 const labels: [string, string] = app.mode === 'ai' ? ['PLAYER 1', 'AI'] : ['PLAYER 1', 'PLAYER 2']
+if (isOnline) labels[net.localSlot] += ' (ВЫ)'
 
 function rematch(): void {
-  go('versus')
+  if (isOnline) requestRematch()
+  else go('versus')
 }
 
-const items = [
-  { label: 'Реванш', run: rematch },
-  { label: 'Выбор персонажа', run: () => go('select') },
-  { label: 'Главное меню', run: () => go('menu') },
-]
+const items = isOnline
+  ? [
+      { label: 'Реванш', run: rematch },
+      { label: 'Выбор персонажа', run: onlineBackToSelect },
+      { label: 'Выйти', run: leaveOnline },
+    ]
+  : [
+      { label: 'Реванш', run: rematch },
+      { label: 'Выбор персонажа', run: () => go('select') },
+      { label: 'Главное меню', run: () => go('menu') },
+    ]
+
+/** online: who already asked for the rematch */
+const rematchNote = computed(() => {
+  if (!isOnline) return ''
+  if (online.status !== 'connected') return online.error || 'Соперник отключился'
+  if (online.localRematch) return 'Ждём ответа соперника...'
+  if (online.remoteRematch) return 'Соперник хочет реванш!'
+  return ''
+})
 const focus = ref(0)
 
 function activate(i: number): void {
@@ -65,7 +84,8 @@ function portrait(slot: PlayerSlot): string {
         <div class="sub">раундов выиграно</div>
       </div>
     </div>
-    <div class="stats hint" v-if="result?.mode === 'ai'">
+    <div class="stats hint" v-if="isOnline">{{ rematchNote || `пинг ${online.ping} мс` }}</div>
+    <div class="stats hint" v-else-if="result?.mode === 'ai'">
       Против AI: {{ statistics.vsAi.wins }} побед / {{ statistics.vsAi.losses }} поражений
     </div>
     <div class="stats hint" v-else>

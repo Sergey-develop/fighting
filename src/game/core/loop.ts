@@ -5,6 +5,8 @@ export interface LoopCallbacks {
   beginFrame(): void
   /** one fixed simulation step */
   step(): void
+  /** online: false while the next step must wait (opponent's input not here yet) */
+  canStep?(): boolean
   /** draw; alpha is the interpolation factor between the last two steps */
   render(alpha: number): void
 }
@@ -51,6 +53,11 @@ export class FixedLoop {
       this.accumulator += dt * this.timeScale
       let steps = 0
       while (this.accumulator >= TICK_MS && steps < FixedLoop.MAX_STEPS_PER_FRAME) {
+        if (this.callbacks.canStep && !this.callbacks.canStep()) {
+          // stalled: don't bank time, or the game would fast-forward afterwards
+          this.accumulator = Math.min(this.accumulator, TICK_MS)
+          break
+        }
         this.callbacks.step()
         this.accumulator -= TICK_MS
         steps++

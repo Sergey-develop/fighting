@@ -19,6 +19,7 @@ function startMode(mode: GameMode): void {
 const items: Item[] = [
   { label: 'Игрок против игрока', run: () => startMode('versus') },
   { label: 'Игрок против AI', run: () => startMode('ai') },
+  { label: 'Онлайн', run: () => go('online') },
   { label: 'Управление', run: () => openOptions('controls') },
   { label: 'Настройки', run: () => openOptions('settings') },
 ]

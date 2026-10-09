@@ -4,6 +4,7 @@ import { audioManager } from './game/audio/audio-manager'
 import { sceneImageUrl } from './game/locations/locations'
 import { app } from './ui/store'
 import MainMenu from './ui/screens/MainMenu.vue'
+import OnlineLobby from './ui/screens/OnlineLobby.vue'
 import CharacterSelect from './ui/screens/CharacterSelect.vue'
 import LocationSelect from './ui/screens/LocationSelect.vue'
 import VersusScreen from './ui/screens/VersusScreen.vue'
@@ -28,6 +29,7 @@ watch(
 <template>
   <div class="stage" :style="stageStyle">
     <MainMenu v-if="app.screen === 'menu'" />
+    <OnlineLobby v-else-if="app.screen === 'online'" />
     <CharacterSelect v-else-if="app.screen === 'select'" />
     <LocationSelect v-else-if="app.screen === 'location'" />
     <VersusScreen v-else-if="app.screen === 'versus'" />
