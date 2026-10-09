@@ -96,7 +96,7 @@ function restart(): void {
       <button class="btn" @click="quit">Главное меню</button>
     </div>
     <div v-if="isOnline && session" class="net-info hint">
-      пинг {{ online.ping }} мс · задержка {{ online.delay }}
+      {{ online.link === 'relay' ? 'через сервер' : 'напрямую' }} · пинг {{ online.ping }} мс · задержка {{ online.delay }}
       <span v-if="desynced" class="desync">· рассинхрон!</span>
     </div>
     <div v-if="netWaiting && !netLost" class="net-wait title">Ожидание соперника...</div>

@@ -51,6 +51,8 @@ export interface OnlineState {
   role: typeof net.role
   code: string
   ping: number
+  /** 'p2p' = direct link, 'relay' = through a public relay */
+  link: typeof net.linkKind
   error: string
   /** opponent's character select seat */
   remoteCursor: number
@@ -72,6 +74,7 @@ export const online = reactive<OnlineState>({
   role: 'host',
   code: '',
   ping: 0,
+  link: null,
   error: '',
   remoteCursor: 0,
   remoteReady: false,
@@ -118,6 +121,7 @@ function syncOnline(): void {
   online.role = net.role
   online.code = net.code
   online.ping = Math.round(net.rtt)
+  online.link = net.linkKind
   online.error = net.error
   if (net.status === 'connected' && was !== 'connected') {
     // new opponent: start from a clean slate and pick fighters

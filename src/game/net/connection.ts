@@ -1,7 +1,18 @@
-import Peer, { type DataConnection, type PeerError } from 'peerjs'
+import Peer from 'peerjs'
+import type { MqttClient } from 'mqtt'
+import {
+  PeerTransport,
+  RELAY_BROKERS,
+  RelayTransport,
+  connectRelay,
+  relayTopic,
+  subscribe,
+  type Transport,
+  type TransportEvents,
+} from './transports'
 
 /** Bumped whenever the message format changes: both sides must run the same build. */
-export const PROTOCOL_VERSION = 1
+export const PROTOCOL_VERSION = 2
 
 /** Messages exchanged between the two browsers. */
 export type NetMessage =
@@ -35,7 +46,16 @@ const PEER_PREFIX = 'vfight-room-'
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
 const CODE_LENGTH = 5
 const PING_INTERVAL_MS = 1000
-const CONNECT_TIMEOUT_MS = 15000
+/** guest: give the direct link this long before also trying the relay */
+const P2P_GRACE_MS = 4000
+const CONNECT_TIMEOUT_MS = 25000
+/** the TURN servers in PeerJS' default config are dead and only slow ICE down */
+const PEER_OPTIONS = {
+  debug: 0,
+  config: {
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }],
+  },
+}
 
 export function randomRoomCode(): string {
   let s = ''
@@ -47,29 +67,21 @@ export function normalizeRoomCode(raw: string): string {
   return raw.toUpperCase().replace(/[^A-Z0-9]/g, '')
 }
 
-function describeError(e: PeerError<string> | Error): string {
-  const type = 'type' in e ? String(e.type) : ''
-  switch (type) {
-    case 'peer-unavailable':
-      return 'Комната не найдена — проверьте код'
-    case 'network':
-    case 'server-error':
-    case 'socket-error':
-    case 'socket-closed':
-      return 'Нет связи с сервером соединения — проверьте интернет'
-    case 'browser-incompatible':
-      return 'Браузер не поддерживает WebRTC'
-    case 'webrtc':
-      return 'Не удалось установить прямое соединение (возможно, мешает NAT / файрвол)'
-    default:
-      return e.message || 'Ошибка соединения'
-  }
+/** Relay handshake: the guest knocks on the host's inbox with its own inbox id. */
+interface JoinMessage {
+  t: 'join'
+  id: string
+}
+
+function isJoin(d: unknown): d is JoinMessage {
+  return typeof d === 'object' && d !== null && (d as JoinMessage).t === 'join' && typeof (d as JoinMessage).id === 'string'
 }
 
 /**
- * Peer-to-peer link between two browsers (WebRTC data channel via PeerJS).
- * The public PeerJS broker is only used to find each other; game traffic goes
- * directly between the players, so no own server is needed.
+ * Link between two browsers. First choice is a direct WebRTC data channel
+ * (PeerJS; its public broker only introduces the players). When that can't be
+ * established — mobile carrier NAT, blocked broker — traffic goes through a
+ * public MQTT relay instead. No own server is needed either way.
  */
 export class NetConnection {
   status: ConnectionStatus = 'idle'
@@ -79,10 +91,17 @@ export class NetConnection {
   rtt = 0
   error = ''
 
+  /** invalidates callbacks of an earlier host()/join() */
+  private session = 0
+  private transport: Transport | null = null
+  /** links being tried that are not the active one yet */
+  private candidates: Transport[] = []
   private peer: Peer | null = null
-  private conn: DataConnection | null = null
+  /** host: relay clients listening for a guest */
+  private listeners: MqttClient[] = []
   private pingTimer = 0
   private connectTimer = 0
+  private graceTimer = 0
   private readonly statusListeners = new Set<() => void>()
   private readonly messageListeners = new Set<(m: NetMessage) => void>()
   /** in-fight traffic that arrived before the fight session subscribed */
@@ -91,6 +110,11 @@ export class NetConnection {
 
   get connected(): boolean {
     return this.status === 'connected'
+  }
+
+  /** 'p2p' = direct, 'relay' = through an MQTT broker */
+  get linkKind(): Transport['kind'] | null {
+    return this.transport?.kind ?? null
   }
 
   /** Seat of this browser: the host is always player 1. */
@@ -117,105 +141,206 @@ export class NetConnection {
     for (const m of queued) cb(m)
   }
 
+  // ------------------------------------------------------------------ host
+
   /** Create a room and wait for the other player. */
   host(): void {
     this.reset()
+    const session = this.session
+    const alive = (): boolean => this.session === session
     this.role = 'host'
     this.code = randomRoomCode()
     this.setStatus('opening')
-    const peer = new Peer(PEER_PREFIX + this.code, { debug: 0 })
+
+    // the room is reachable through PeerJS and through every relay that answers
+    let pending = 1 + RELAY_BROKERS.length
+    const opened = (): void => {
+      if (alive() && this.status === 'opening') this.setStatus('waiting')
+    }
+    const failed = (): void => {
+      if (!alive()) return
+      pending--
+      if (pending === 0 && this.status === 'opening') this.lost('Нет связи с серверами соединения — проверьте интернет')
+    }
+
+    const peer = new Peer(PEER_PREFIX + this.code, PEER_OPTIONS)
     this.peer = peer
-    // a destroyed peer still fires events: only the current one counts
-    const current = (): boolean => this.peer === peer
-    peer.on('open', () => {
-      if (current()) this.setStatus('waiting')
-    })
+    let peerFailed = false
+    const peerFail = (): void => {
+      if (peerFailed) return
+      peerFailed = true
+      failed()
+    }
+    peer.on('open', opened)
     peer.on('connection', (c) => {
-      if (!current()) return
-      if (this.conn) {
-        // the room is full
+      if (!alive() || this.transport) {
         c.on('open', () => c.close())
         return
       }
-      this.attach(c)
+      const t: Transport = new PeerTransport(c, this.events(session, () => t))
+      this.candidates.push(t)
+      c.on('open', () => {
+        if (alive() && !this.transport) this.adopt(t)
+        else t.close()
+      })
     })
     peer.on('error', (e) => {
-      if (!current()) return
-      if (e.type === 'unavailable-id') {
+      if (!alive()) return
+      if (e.type === 'unavailable-id' && this.status === 'opening') {
         this.host() // code collision: try another one
         return
       }
-      this.fail(e)
+      peerFail()
     })
     peer.on('disconnected', () => {
-      // lost the broker; an established game keeps running peer-to-peer
-      if (current() && !this.connected) this.fail(new Error('Соединение с сервером потеряно'))
+      if (alive()) peerFail()
     })
+
+    const inbox = relayTopic(this.code, 'h')
+    for (const url of RELAY_BROKERS) {
+      connectRelay(url)
+        .then(async (client) => {
+          if (!alive()) {
+            client.end(true)
+            return
+          }
+          this.listeners.push(client)
+          await subscribe(client, inbox)
+          client.on('message', (topic, payload) => {
+            if (!alive() || this.transport || topic !== inbox) return
+            let d: unknown
+            try {
+              d = JSON.parse(payload.toString())
+            } catch {
+              return
+            }
+            if (!isJoin(d)) return
+            this.listeners = this.listeners.filter((c) => c !== client)
+            const t: Transport = new RelayTransport(client, relayTopic(this.code, `g-${d.id}`), inbox, this.events(session, () => t))
+            this.adopt(t)
+          })
+          opened()
+        })
+        .catch(failed)
+    }
   }
+
+  // ----------------------------------------------------------------- guest
 
   /** Join the room with the given code. */
   join(rawCode: string): void {
     this.reset()
+    const session = this.session
+    const alive = (): boolean => this.session === session
     this.role = 'guest'
     this.code = normalizeRoomCode(rawCode)
-    this.setStatus('opening')
-    const peer = new Peer({ debug: 0 })
+    this.setStatus('connecting')
+
+    let relayStarted = false
+    const startRelay = (): void => {
+      if (relayStarted || !alive() || this.transport) return
+      relayStarted = true
+      this.joinRelays(session)
+    }
+
+    const peer = new Peer(PEER_OPTIONS)
     this.peer = peer
-    const current = (): boolean => this.peer === peer
     peer.on('open', () => {
-      if (!current()) return
-      this.setStatus('connecting')
-      this.attach(peer.connect(PEER_PREFIX + this.code, { reliable: true, serialization: 'json' }))
-      this.connectTimer = window.setTimeout(() => {
-        if (!this.connected) this.fail(new Error('Не удалось подключиться: соперник не отвечает'))
-      }, CONNECT_TIMEOUT_MS)
+      if (!alive()) return
+      const c = peer.connect(PEER_PREFIX + this.code, { reliable: true, serialization: 'json' })
+      // adopted once the host greets on it (see events)
+      const t: Transport = new PeerTransport(c, this.events(session, () => t))
+      this.candidates.push(t)
     })
-    peer.on('error', (e) => {
-      if (current()) this.fail(e)
-    })
+    // PeerJS blocked, or the room is only reachable through a relay
+    peer.on('error', startRelay)
+    this.graceTimer = window.setTimeout(startRelay, P2P_GRACE_MS)
+    this.connectTimer = window.setTimeout(() => {
+      if (alive() && !this.transport) this.lost('Не удалось подключиться: комната не найдена или соперник недоступен')
+    }, CONNECT_TIMEOUT_MS)
   }
 
+  private joinRelays(session: number): void {
+    const id = Math.random().toString(36).slice(2, 10)
+    const inbox = relayTopic(this.code, `g-${id}`)
+    const hostInbox = relayTopic(this.code, 'h')
+    for (const url of RELAY_BROKERS) {
+      connectRelay(url)
+        .then(async (client) => {
+          if (this.session !== session || this.transport) {
+            client.end(true)
+            return
+          }
+          const t: Transport = new RelayTransport(client, hostInbox, inbox, this.events(session, () => t))
+          this.candidates.push(t)
+          await subscribe(client, inbox)
+          const join: JoinMessage = { t: 'join', id }
+          t.send(join)
+        })
+        .catch(() => {})
+    }
+  }
+
+  // ------------------------------------------------------------- traffic
+
   send(m: NetMessage): void {
-    if (this.conn?.open) void this.conn.send(m)
+    this.transport?.send(m)
   }
 
   /** Leave the room (tells the other side). */
   leave(): void {
-    if (this.connected) this.send({ t: 'bye' })
-    // let the goodbye flush before tearing the channel down
-    const conn = this.conn
-    const peer = this.peer
-    this.conn = null
-    this.peer = null
-    window.setTimeout(() => {
-      conn?.close()
-      peer?.destroy()
-    }, 100)
+    const t = this.transport
+    if (t && this.connected) {
+      const bye: NetMessage = { t: 'bye' }
+      t.send(bye)
+      this.transport = null
+      // let the goodbye flush before tearing the link down
+      window.setTimeout(() => t.close(), 150)
+    }
     this.reset()
     this.setStatus('idle')
   }
 
-  private attach(c: DataConnection): void {
-    this.conn = c
-    c.on('open', () => {
-      if (this.conn !== c) return
-      window.clearTimeout(this.connectTimer)
-      this.send({ t: 'hello', v: PROTOCOL_VERSION })
-      this.pingTimer = window.setInterval(() => this.send({ t: 'ping', at: performance.now() }), PING_INTERVAL_MS)
-      this.send({ t: 'ping', at: performance.now() })
-      this.setStatus('connected')
-    })
-    c.on('data', (data) => {
-      if (this.conn === c) this.receive(data as NetMessage)
-    })
-    c.on('close', () => {
-      if (this.conn !== c) return
-      this.lost('Соперник отключился')
-    })
-    c.on('error', (e) => {
-      if (this.conn !== c) return
-      this.lost(e.message || 'Соединение прервано')
-    })
+  private events(session: number, self: () => Transport): TransportEvents {
+    return {
+      message: (d) => {
+        if (this.session !== session) return
+        const t = self()
+        const m = d as NetMessage
+        if (this.transport === t) this.receive(m)
+        else if (!this.transport && this.role === 'guest' && m.t === 'hello') {
+          // the host picked this link
+          this.adopt(t)
+          this.receive(m)
+        }
+      },
+      closed: (reason) => {
+        if (this.session !== session) return
+        const t = self()
+        if (this.transport === t) this.lost(reason)
+        else this.candidates = this.candidates.filter((c) => c !== t)
+      },
+    }
+  }
+
+  /** Make `t` the active link and drop every other attempt. */
+  private adopt(t: Transport): void {
+    this.transport = t
+    window.clearTimeout(this.connectTimer)
+    window.clearTimeout(this.graceTimer)
+    for (const c of this.candidates) if (c !== t) c.close()
+    this.candidates = []
+    for (const c of this.listeners) c.end(true)
+    this.listeners = []
+    // a relayed game doesn't need the PeerJS broker any more
+    if (t.kind === 'relay') {
+      this.peer?.destroy()
+      this.peer = null
+    }
+    this.send({ t: 'hello', v: PROTOCOL_VERSION })
+    this.send({ t: 'ping', at: performance.now() })
+    this.pingTimer = window.setInterval(() => this.send({ t: 'ping', at: performance.now() }), PING_INTERVAL_MS)
+    this.setStatus('connected')
   }
 
   private receive(m: NetMessage): void {
@@ -245,27 +370,23 @@ export class NetConnection {
   }
 
   private lost(reason: string): void {
-    const peer = this.peer
-    const conn = this.conn
-    this.conn = null
-    this.peer = null
-    conn?.close()
-    peer?.destroy()
     this.reset()
     this.error = reason
     this.setStatus('closed')
   }
 
-  private fail(e: PeerError<string> | Error): void {
-    this.lost(describeError(e))
-  }
-
   private reset(): void {
+    this.session++
     window.clearInterval(this.pingTimer)
     window.clearTimeout(this.connectTimer)
-    this.conn?.close()
+    window.clearTimeout(this.graceTimer)
+    this.transport?.close()
+    this.transport = null
+    for (const c of this.candidates) c.close()
+    this.candidates = []
+    for (const c of this.listeners) c.end(true)
+    this.listeners = []
     this.peer?.destroy()
-    this.conn = null
     this.peer = null
     this.rtt = 0
     this.error = ''
