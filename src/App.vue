@@ -38,4 +38,47 @@ watch(
     <ControlsScreen v-else-if="app.screen === 'controls'" />
     <SettingsScreen v-else-if="app.screen === 'settings'" />
   </div>
+  <div class="rotate-hint">
+    <div class="phone">📱</div>
+    <p>Поверните телефон горизонтально</p>
+  </div>
 </template>
+
+<style scoped>
+.rotate-hint {
+  display: none;
+}
+/* phones held upright: the 16:9 stage would be a thin strip */
+@media (orientation: portrait) and (pointer: coarse) {
+  .rotate-hint {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6vw;
+    padding: 8vw;
+    background: #120a24;
+    color: #fff;
+    font-size: 4.5vw;
+    line-height: 1.6;
+    text-align: center;
+  }
+  .phone {
+    font-size: 20vw;
+    animation: turn 1.6s ease-in-out infinite;
+  }
+}
+@keyframes turn {
+  0%,
+  30% {
+    transform: rotate(0deg);
+  }
+  60%,
+  100% {
+    transform: rotate(-90deg);
+  }
+}
+</style>

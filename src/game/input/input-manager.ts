@@ -87,6 +87,9 @@ export class InputManager {
 
   private readonly keysHeld = new Set<KeyCode>()
   private readonly keysPending = new Set<KeyCode>()
+  /** on-screen touch buttons (phones): action bits, they drive player 1 */
+  private touchHeld = 0
+  private touchPending = 0
   private readonly pads: PadState[] = Array.from({ length: MAX_PADS }, () => new PadState())
   private readonly listeners = new Set<() => void>()
   /** at least one connected pad uses the standard (Xbox-style) mapping */
@@ -249,9 +252,18 @@ export class InputManager {
     }
   }
 
+  /** An on-screen touch button went down / up (`bit` from ACTION_BIT). */
+  setTouch(bit: number, down: boolean): void {
+    if (down) {
+      if (!(this.touchHeld & bit)) this.touchPending |= bit
+      this.touchHeld |= bit
+    } else this.touchHeld &= ~bit
+  }
+
   /** Forget edges once they were consumed by a simulation tick / menu frame. */
   endTick(): void {
     this.keysPending.clear()
+    this.touchPending = 0
     for (const p of this.pads) {
       p.pending.fill(0)
       p.menuPending.fill(0)
@@ -263,6 +275,10 @@ export class InputManager {
   readPlayer(slot: PlayerSlot, out: InputFrame): void {
     out.held = 0
     out.pressed = 0
+    if (slot === 0) {
+      out.held |= this.touchHeld
+      out.pressed |= this.touchPending
+    }
     const pc = this.controls.players[slot]
     const dev = pc.device
     if (dev.kind === 'keyboard') {
@@ -298,6 +314,8 @@ export class InputManager {
       }
     }
     this.readPads(pc, out, -1)
+    out.held |= this.touchHeld
+    out.pressed |= this.touchPending
   }
 
   /**
@@ -534,6 +552,7 @@ export class InputManager {
 
   private readonly onBlur = (): void => {
     this.keysHeld.clear()
+    this.touchHeld = 0
   }
 
   private readonly onPadEvent = (): void => {

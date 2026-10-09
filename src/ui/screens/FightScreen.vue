@@ -6,6 +6,7 @@ import { locationImage } from '@/game/locations/locations'
 import { net } from '@/game/net/connection'
 import FightHud from '../components/FightHud.vue'
 import PauseMenu from '../components/PauseMenu.vue'
+import TouchControls from '../components/TouchControls.vue'
 import { app, go, leaveOnline, online, recordResult, settings } from '../store'
 
 const canvas = ref<HTMLCanvasElement | null>(null)
@@ -69,6 +70,11 @@ onBeforeUnmount(() => {
   session.value?.destroy()
 })
 
+function pause(): void {
+  session.value?.setPaused(true)
+  paused.value = session.value?.paused ?? false
+}
+
 function resume(): void {
   session.value?.setPaused(false)
   paused.value = session.value?.paused ?? false
@@ -95,6 +101,7 @@ function restart(): void {
       <pre>{{ error }}</pre>
       <button class="btn" @click="quit">Главное меню</button>
     </div>
+    <TouchControls v-if="session && !paused && !netLost" @pause="pause" />
     <div v-if="isOnline && session" class="net-info hint">
       {{ online.link === 'relay' ? 'через сервер' : 'напрямую' }} · пинг {{ online.ping }} мс · задержка {{ online.delay }}
       <span v-if="desynced" class="desync">· рассинхрон!</span>
