@@ -93,6 +93,10 @@ export class NetConnection {
 
   /** invalidates callbacks of an earlier host()/join() */
   private session = 0
+  /** lobby diagnostics: PeerJS broker reachable, relays reachable */
+  p2pReady = false
+  relaysReady = 0
+  relayTried = false
   private transport: Transport | null = null
   /** links being tried that are not the active one yet */
   private candidates: Transport[] = []
@@ -171,7 +175,12 @@ export class NetConnection {
       peerFailed = true
       failed()
     }
-    peer.on('open', opened)
+    peer.on('open', () => {
+      if (!alive()) return
+      this.p2pReady = true
+      opened()
+      this.emitStatus()
+    })
     peer.on('connection', (c) => {
       if (!alive() || this.transport) {
         c.on('open', () => c.close())
@@ -219,7 +228,9 @@ export class NetConnection {
             const t: Transport = new RelayTransport(client, relayTopic(this.code, `g-${d.id}`), inbox, this.events(session, () => t))
             this.adopt(t)
           })
+          this.relaysReady++
           opened()
+          this.emitStatus()
         })
         .catch(failed)
     }
@@ -240,6 +251,8 @@ export class NetConnection {
     const startRelay = (): void => {
       if (relayStarted || !alive() || this.transport) return
       relayStarted = true
+      this.relayTried = true
+      this.emitStatus()
       this.joinRelays(session)
     }
 
@@ -247,6 +260,8 @@ export class NetConnection {
     this.peer = peer
     peer.on('open', () => {
       if (!alive()) return
+      this.p2pReady = true
+      this.emitStatus()
       const c = peer.connect(PEER_PREFIX + this.code, { reliable: true, serialization: 'json' })
       // adopted once the host greets on it (see events)
       const t: Transport = new PeerTransport(c, this.events(session, () => t))
@@ -276,6 +291,8 @@ export class NetConnection {
           await subscribe(client, inbox)
           const join: JoinMessage = { t: 'join', id }
           t.send(join)
+          this.relaysReady++
+          this.emitStatus()
         })
         .catch(() => {})
     }
@@ -391,6 +408,9 @@ export class NetConnection {
     this.rtt = 0
     this.error = ''
     this.gameInbox = []
+    this.p2pReady = false
+    this.relaysReady = 0
+    this.relayTried = false
   }
 
   private setStatus(s: ConnectionStatus): void {

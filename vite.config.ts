@@ -5,6 +5,10 @@ import vue from '@vitejs/plugin-vue'
 export default defineConfig({
   base: './',
   plugins: [vue()],
+  define: {
+    // Moscow time, minutes precision
+    __BUILD_TIME__: JSON.stringify(new Date(Date.now() + 3 * 3600_000).toISOString().slice(5, 16).replace('T', ' ')),
+  },
   resolve: {
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
   },

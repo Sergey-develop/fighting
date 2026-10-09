@@ -7,6 +7,7 @@ import { DEFAULT_LOCATION_ID } from '@/game/locations/locations'
 import { inputManager } from '@/game/input/input-manager'
 import { net } from '@/game/net/connection'
 import { inputDelayForRtt } from '@/game/net/lockstep'
+import { RELAY_BROKERS } from '@/game/net/transports'
 import {
   controlsRecord,
   defaultStatistics,
@@ -53,6 +54,8 @@ export interface OnlineState {
   ping: number
   /** 'p2p' = direct link, 'relay' = through a public relay */
   link: typeof net.linkKind
+  /** lobby diagnostics line */
+  diag: string
   error: string
   /** opponent's character select seat */
   remoteCursor: number
@@ -75,6 +78,7 @@ export const online = reactive<OnlineState>({
   code: '',
   ping: 0,
   link: null,
+  diag: '',
   error: '',
   remoteCursor: 0,
   remoteReady: false,
@@ -122,6 +126,11 @@ function syncOnline(): void {
   online.code = net.code
   online.ping = Math.round(net.rtt)
   online.link = net.linkKind
+  const relays = `серверы ${net.relaysReady}/${RELAY_BROKERS.length}`
+  online.diag =
+    net.role === 'host' || net.relayTried
+      ? `P2P ${net.p2pReady ? '✓' : '✗'} · ${relays}`
+      : `P2P ${net.p2pReady ? '✓' : '…'}`
   online.error = net.error
   if (net.status === 'connected' && was !== 'connected') {
     // new opponent: start from a clean slate and pick fighters

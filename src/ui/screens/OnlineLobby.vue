@@ -6,6 +6,9 @@ import { net, normalizeRoomCode } from '@/game/net/connection'
 import { leaveOnline, online } from '../store'
 import { useMenuInput } from '../use-menu-input'
 
+/** shown in the corner: tells at a glance whether a player has a stale page */
+const BUILD = __BUILD_TIME__
+
 const codeInput = ref('')
 const input = ref<HTMLInputElement | null>(null)
 const copied = ref(false)
@@ -121,11 +124,13 @@ useMenuInput(({ any }) => {
 
     <p v-if="statusText" class="status">{{ statusText }}</p>
     <p v-if="online.error" class="error">{{ online.error }}</p>
+    <p v-if="busy && online.diag" class="hint small diag">{{ online.diag }}</p>
 
     <p class="hint note">
       Игра идёт напрямую между браузерами. Оба играют своими кнопками Игрока 1 (или любым геймпадом).
     </p>
     <button class="btn ghost back" @click="back">Назад</button>
+    <span class="build">сборка {{ BUILD }}</span>
   </div>
 </template>
 
@@ -229,6 +234,16 @@ useMenuInput(({ any }) => {
   max-width: 60cqw;
   text-align: center;
   line-height: 1.6;
+}
+.diag {
+  position: relative;
+}
+.build {
+  position: absolute;
+  right: 2cqw;
+  bottom: 2cqw;
+  font-size: 0.6cqw;
+  color: var(--muted);
 }
 .back {
   position: absolute;
