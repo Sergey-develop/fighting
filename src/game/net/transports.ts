@@ -2,18 +2,15 @@ import type { DataConnection } from 'peerjs'
 import type { MqttClient } from 'mqtt'
 
 /**
- * Public MQTT brokers (WebSocket over 443-style TLS ports) used as a relay
- * when a direct WebRTC link can't be made — e.g. a phone on mobile internet
- * behind carrier NAT. Both sides try all of them and meet on the first one
- * that works for both.
+ * Public MQTT brokers (WebSocket over TLS) used as a relay when a direct
+ * WebRTC link can't be made — e.g. a phone on mobile internet behind carrier
+ * NAT. The host listens on all of them; the guest tries them in this order
+ * (fastest first) and the two meet on the first one that works for both.
+ * (broker.emqx.io is left out: it throttles 60 messages/s down to a trickle.)
  */
-export const RELAY_BROKERS: readonly string[] = [
-  'wss://broker.hivemq.com:8884/mqtt',
-  'wss://test.mosquitto.org:8081/mqtt',
-  'wss://broker.emqx.io:8084/mqtt',
-]
+export const RELAY_BROKERS: readonly string[] = ['wss://broker.hivemq.com:8884/mqtt', 'wss://test.mosquitto.org:8081/mqtt']
 
-const RELAY_CONNECT_TIMEOUT_MS = 8000
+const RELAY_CONNECT_TIMEOUT_MS = 6000
 
 export function relayTopic(code: string, box: string): string {
   return `vfight/v2/${code}/${box}`
@@ -104,7 +101,9 @@ export class RelayTransport implements Transport {
 
 /** Connect to a relay broker (the MQTT client is loaded on demand). */
 export async function connectRelay(url: string): Promise<MqttClient> {
-  const { connect } = await import('mqtt')
+  // the browser build of mqtt only has a default export; Node's has named ones
+  const mod = (await import('mqtt')) as typeof import('mqtt') & { default?: typeof import('mqtt') }
+  const connect = mod.default?.connect ?? mod.connect
   return new Promise((resolve, reject) => {
     const client = connect(url, {
       connectTimeout: RELAY_CONNECT_TIMEOUT_MS,

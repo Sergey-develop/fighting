@@ -48,7 +48,11 @@ const CODE_LENGTH = 5
 const PING_INTERVAL_MS = 1000
 /** guest: give the direct link this long before also trying the relay */
 const P2P_GRACE_MS = 4000
-const CONNECT_TIMEOUT_MS = 25000
+const CONNECT_TIMEOUT_MS = 30000
+/** guest: how long to wait for the host's answer on one relay before trying the next */
+const RELAY_ANSWER_MS = 4000
+/** host: the guest must greet back on the adopted link within this time */
+const HELLO_TIMEOUT_MS = 8000
 /** the TURN servers in PeerJS' default config are dead and only slow ICE down */
 const PEER_OPTIONS = {
   debug: 0,
@@ -106,6 +110,7 @@ export class NetConnection {
   private pingTimer = 0
   private connectTimer = 0
   private graceTimer = 0
+  private helloTimer = 0
   private readonly statusListeners = new Set<() => void>()
   private readonly messageListeners = new Set<(m: NetMessage) => void>()
   /** in-fight traffic that arrived before the fight session subscribed */
@@ -253,7 +258,7 @@ export class NetConnection {
       relayStarted = true
       this.relayTried = true
       this.emitStatus()
-      this.joinRelays(session)
+      void this.joinRelays(session)
     }
 
     const peer = new Peer(PEER_OPTIONS)
@@ -275,26 +280,41 @@ export class NetConnection {
     }, CONNECT_TIMEOUT_MS)
   }
 
-  private joinRelays(session: number): void {
+  /** Knock on the host through each relay in turn until it answers on one. */
+  private async joinRelays(session: number): Promise<void> {
     const id = Math.random().toString(36).slice(2, 10)
     const inbox = relayTopic(this.code, `g-${id}`)
     const hostInbox = relayTopic(this.code, 'h')
+    const done = (): boolean => this.session !== session || this.transport !== null
     for (const url of RELAY_BROKERS) {
-      connectRelay(url)
-        .then(async (client) => {
-          if (this.session !== session || this.transport) {
-            client.end(true)
-            return
-          }
-          const t: Transport = new RelayTransport(client, hostInbox, inbox, this.events(session, () => t))
-          this.candidates.push(t)
-          await subscribe(client, inbox)
-          const join: JoinMessage = { t: 'join', id }
-          t.send(join)
-          this.relaysReady++
-          this.emitStatus()
-        })
-        .catch(() => {})
+      if (done()) return
+      let client: MqttClient
+      try {
+        client = await connectRelay(url)
+      } catch {
+        continue
+      }
+      if (done()) {
+        client.end(true)
+        return
+      }
+      const t: Transport = new RelayTransport(client, hostInbox, inbox, this.events(session, () => t))
+      this.candidates.push(t)
+      try {
+        await subscribe(client, inbox)
+      } catch {
+        t.close()
+        continue
+      }
+      const join: JoinMessage = { t: 'join', id }
+      t.send(join)
+      this.relaysReady++
+      this.emitStatus()
+      // the host answers with 'hello' on this relay (adopted in events)
+      await new Promise((r) => window.setTimeout(r, RELAY_ANSWER_MS))
+      if (done()) return
+      t.close()
+      this.candidates = this.candidates.filter((c) => c !== t)
     }
   }
 
@@ -357,12 +377,17 @@ export class NetConnection {
     this.send({ t: 'hello', v: PROTOCOL_VERSION })
     this.send({ t: 'ping', at: performance.now() })
     this.pingTimer = window.setInterval(() => this.send({ t: 'ping', at: performance.now() }), PING_INTERVAL_MS)
+    if (this.role === 'host') {
+      // the guest may have given up on this link already (it moved to another relay)
+      this.helloTimer = window.setTimeout(() => this.lost('Соперник не ответил — создайте комнату заново'), HELLO_TIMEOUT_MS)
+    }
     this.setStatus('connected')
   }
 
   private receive(m: NetMessage): void {
     switch (m.t) {
       case 'hello':
+        window.clearTimeout(this.helloTimer)
         if (m.v !== PROTOCOL_VERSION) this.lost('У соперника другая версия игры — обновите страницу')
         return
       case 'ping':
@@ -397,6 +422,7 @@ export class NetConnection {
     window.clearInterval(this.pingTimer)
     window.clearTimeout(this.connectTimer)
     window.clearTimeout(this.graceTimer)
+    window.clearTimeout(this.helloTimer)
     this.transport?.close()
     this.transport = null
     for (const c of this.candidates) c.close()
