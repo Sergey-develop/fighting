@@ -211,8 +211,8 @@ export class NetConnection {
     })
 
     const inbox = relayTopic(this.code, 'h')
-    for (const url of RELAY_BROKERS) {
-      connectRelay(url)
+    for (const broker of RELAY_BROKERS) {
+      connectRelay(broker)
         .then(async (client) => {
           if (!alive()) {
             client.end(true)
@@ -286,11 +286,11 @@ export class NetConnection {
     const inbox = relayTopic(this.code, `g-${id}`)
     const hostInbox = relayTopic(this.code, 'h')
     const done = (): boolean => this.session !== session || this.transport !== null
-    for (const url of RELAY_BROKERS) {
+    for (const broker of RELAY_BROKERS) {
       if (done()) return
       let client: MqttClient
       try {
-        client = await connectRelay(url)
+        client = await connectRelay(broker)
       } catch {
         continue
       }

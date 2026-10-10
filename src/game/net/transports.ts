@@ -1,14 +1,26 @@
 import type { DataConnection } from 'peerjs'
 import type { MqttClient } from 'mqtt'
 
+export interface RelayBroker {
+  url: string
+  username?: string
+  password?: string
+}
+
 /**
  * Public MQTT brokers (WebSocket over TLS) used as a relay when a direct
  * WebRTC link can't be made — e.g. a phone on mobile internet behind carrier
  * NAT. The host listens on all of them; the guest tries them in this order
- * (fastest first) and the two meet on the first one that works for both.
+ * and the two meet on the first one that works for both.
+ * shiftr.io comes first: it is on port 443, which almost every network lets
+ * through; the others use ports that mobile / office networks often block.
  * (broker.emqx.io is left out: it throttles 60 messages/s down to a trickle.)
  */
-export const RELAY_BROKERS: readonly string[] = ['wss://broker.hivemq.com:8884/mqtt', 'wss://test.mosquitto.org:8081/mqtt']
+export const RELAY_BROKERS: readonly RelayBroker[] = [
+  { url: 'wss://public.cloud.shiftr.io:443', username: 'public', password: 'public' },
+  { url: 'wss://broker.hivemq.com:8884/mqtt' },
+  { url: 'wss://test.mosquitto.org:8081/mqtt' },
+]
 
 const RELAY_CONNECT_TIMEOUT_MS = 6000
 
@@ -100,12 +112,14 @@ export class RelayTransport implements Transport {
 }
 
 /** Connect to a relay broker (the MQTT client is loaded on demand). */
-export async function connectRelay(url: string): Promise<MqttClient> {
+export async function connectRelay(broker: RelayBroker): Promise<MqttClient> {
   // the browser build of mqtt only has a default export; Node's has named ones
   const mod = (await import('mqtt')) as typeof import('mqtt') & { default?: typeof import('mqtt') }
   const connect = mod.default?.connect ?? mod.connect
   return new Promise((resolve, reject) => {
-    const client = connect(url, {
+    const client = connect(broker.url, {
+      username: broker.username,
+      password: broker.password,
       connectTimeout: RELAY_CONNECT_TIMEOUT_MS,
       reconnectPeriod: 0,
       clean: true,
