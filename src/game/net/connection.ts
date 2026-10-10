@@ -298,7 +298,7 @@ export class NetConnection {
         client.end(true)
         return
       }
-      const t: Transport = new RelayTransport(client, hostInbox, inbox, this.events(session, () => t))
+      const t: RelayTransport = new RelayTransport(client, hostInbox, inbox, this.events(session, () => t))
       this.candidates.push(t)
       try {
         await subscribe(client, inbox)
@@ -307,7 +307,7 @@ export class NetConnection {
         continue
       }
       const join: JoinMessage = { t: 'join', id }
-      t.send(join)
+      t.sendRaw(join)
       this.relaysReady++
       this.emitStatus()
       // the host answers with 'hello' on this relay (adopted in events)

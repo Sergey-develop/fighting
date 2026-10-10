@@ -71,43 +71,159 @@ export class PeerTransport implements Transport {
   }
 }
 
+/** How long a relay link may be down (reconnecting) before the game gives up. */
+const RELAY_OUTAGE_MS = 45000
+const RELAY_RECONNECT_MS = 1000
+/** unacknowledged messages older than this are sent again */
+const RELAY_RESEND_MS = 1500
+const RELAY_ACK_MS = 200
+const RELAY_MAX_UNACKED = 5000
+
+/**
+ * Relay envelope. Public brokers drop whatever arrives while a client is
+ * reconnecting (a phone switching apps, a network blip), so the relay link
+ * numbers its messages and resends until the other side acknowledges them.
+ */
+interface Envelope {
+  /** sequence number of `d` */
+  q?: number
+  d?: unknown
+  /** acknowledges every message with q < a */
+  a: number
+}
+
+function isEnvelope(v: unknown): v is Envelope {
+  return typeof v === 'object' && v !== null && typeof (v as Envelope).a === 'number'
+}
+
 export class RelayTransport implements Transport {
   readonly kind = 'relay'
   private done = false
+  /** next sequence number to send */
+  private nextOut = 0
+  /** sent, not yet acknowledged: seq → [payload, last sent at] */
+  private readonly unacked = new Map<number, [string, number]>()
+  /** next sequence number expected from the other side */
+  private nextIn = 0
+  private readonly early = new Map<number, unknown>()
+  private ackDirty = false
+  private readonly timer: number
+  private outageTimer = 0
 
   constructor(
     private readonly client: MqttClient,
     private readonly outTopic: string,
     inTopic: string,
-    events: TransportEvents,
+    private readonly events: TransportEvents,
   ) {
+    client.options.reconnectPeriod = RELAY_RECONNECT_MS
     client.on('message', (topic, payload) => {
       if (this.done || topic !== inTopic) return
-      let data: unknown
+      let v: unknown
       try {
-        data = JSON.parse(payload.toString())
+        v = JSON.parse(payload.toString())
       } catch {
         return
       }
-      events.message(data)
+      // anything else on the inbox (another guest knocking) is not ours
+      if (isEnvelope(v)) this.receive(v)
     })
-    const lost = (): void => {
-      if (this.done) return
-      this.done = true
-      events.closed('Связь с ретранслятором потеряна')
-    }
-    client.on('close', lost)
-    client.on('offline', lost)
+    client.on('offline', () => this.down())
+    client.on('close', () => this.down())
+    client.on('connect', () => {
+      // back after a blip: the broker lost what was in flight, send it again
+      window.clearTimeout(this.outageTimer)
+      this.outageTimer = 0
+      this.resend(true)
+    })
+    this.timer = window.setInterval(() => this.tick(), RELAY_ACK_MS)
+    document.addEventListener('visibilitychange', this.onVisible)
   }
 
   send(data: unknown): void {
-    // QoS 1: lockstep can't afford a lost input
-    if (!this.done) this.client.publish(this.outTopic, JSON.stringify(data), { qos: 1 })
+    if (this.done) return
+    const q = this.nextOut++
+    const payload = JSON.stringify({ q, d: data, a: this.nextIn } satisfies Envelope)
+    this.unacked.set(q, [payload, performance.now()])
+    this.ackDirty = false
+    if (this.unacked.size > RELAY_MAX_UNACKED) this.fail()
+    else this.publish(payload)
+  }
+
+  /** Un-numbered message (the relay handshake before a link exists). */
+  sendRaw(data: unknown): void {
+    if (!this.done) this.publish(JSON.stringify(data))
   }
 
   close(): void {
-    this.done = true
+    if (this.done) return
+    this.stop()
     this.client.end(false)
+  }
+
+  private publish(payload: string): void {
+    // QoS 1 for the broker hop; end-to-end delivery is ensured by the acks
+    if (this.client.connected) this.client.publish(this.outTopic, payload, { qos: 1 })
+  }
+
+  private receive(e: Envelope): void {
+    for (const q of this.unacked.keys()) if (q < e.a) this.unacked.delete(q)
+    if (e.q === undefined) return
+    this.ackDirty = true
+    if (e.q < this.nextIn) return // duplicate of a resend
+    this.early.set(e.q, e.d)
+    while (this.early.has(this.nextIn)) {
+      const d = this.early.get(this.nextIn)
+      this.early.delete(this.nextIn)
+      this.nextIn++
+      this.events.message(d)
+      if (this.done) return
+    }
+  }
+
+  private tick(): void {
+    if (this.done || !this.client.connected) return
+    if (this.ackDirty) {
+      this.ackDirty = false
+      this.publish(JSON.stringify({ a: this.nextIn } satisfies Envelope))
+    }
+    this.resend(false)
+  }
+
+  private resend(all: boolean): void {
+    const now = performance.now()
+    for (const entry of this.unacked.values()) {
+      if (!all && now - entry[1] < RELAY_RESEND_MS) continue
+      entry[1] = now
+      this.publish(entry[0])
+    }
+  }
+
+  private down(): void {
+    if (this.done || this.outageTimer) return
+    this.outageTimer = window.setTimeout(() => this.fail(), RELAY_OUTAGE_MS)
+  }
+
+  /** A suspended page (phone screen off, app switched) gets a fresh grace period. */
+  private readonly onVisible = (): void => {
+    if (document.visibilityState !== 'visible' || this.done || !this.outageTimer) return
+    window.clearTimeout(this.outageTimer)
+    this.outageTimer = window.setTimeout(() => this.fail(), RELAY_OUTAGE_MS)
+    if (!this.client.connected) this.client.reconnect()
+  }
+
+  private fail(): void {
+    if (this.done) return
+    this.stop()
+    this.client.end(true)
+    this.events.closed('Связь с ретранслятором потеряна')
+  }
+
+  private stop(): void {
+    this.done = true
+    window.clearInterval(this.timer)
+    window.clearTimeout(this.outageTimer)
+    document.removeEventListener('visibilitychange', this.onVisible)
   }
 }
 
