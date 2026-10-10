@@ -68,6 +68,29 @@ function onCodeInput(): void {
 
 void nextTick(() => input.value?.focus())
 
+/**
+ * A tab left open for hours runs an old build that can't talk to the new one.
+ * Before playing online, compare with the published page and reload if newer.
+ */
+async function reloadIfStale(): Promise<void> {
+  if (import.meta.env.DEV || online.status === 'connected') return
+  try {
+    const html = await (await fetch(`./?v=${Date.now()}`, { cache: 'no-store' })).text()
+    const latest = /assets\/index-[\w-]+\.js/.exec(html)?.[0]
+    const current = [...document.scripts].map((s) => s.src).find((src) => src.includes('/assets/index-'))
+    if (!latest || !current || current.endsWith(latest)) return
+    // at most once a minute, in case the CDN still serves the old page
+    const last = Number(sessionStorage.getItem('fighting.reloadedAt') ?? 0)
+    if (Date.now() - last < 60_000) return
+    sessionStorage.setItem('fighting.reloadedAt', String(Date.now()))
+    // the query string skips the browser's cached copy of the page
+    location.replace(`${location.pathname}?v=${Date.now()}`)
+  } catch {
+    // offline or blocked: keep the page as it is
+  }
+}
+void reloadIfStale()
+
 useMenuInput(({ any }) => {
   // typing a code must not trigger menu actions
   if (document.activeElement === input.value) return
