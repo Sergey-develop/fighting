@@ -319,6 +319,29 @@ export class InputManager {
   }
 
   /**
+   * Online: one person at this device plays one fighter, whichever side it is
+   * on — both keyboard binding sets (WASD… and arrows…), every gamepad (with
+   * player 1's button mapping, as against the AI) and the touch buttons.
+   * Player 2 keys that player 1 also uses are skipped, so one key never
+   * triggers two different actions.
+   */
+  readSoloPlayer(out: InputFrame): void {
+    this.readPlayerAnyDevice(0, out)
+    const p1 = this.controls.players[0].keyboard
+    const taken = new Set<KeyCode>()
+    for (const action of INPUT_ACTIONS) for (const code of p1[action]) taken.add(code)
+    const p2 = this.controls.players[1].keyboard
+    for (const action of INPUT_ACTIONS) {
+      const bit = ACTION_BIT[action]
+      for (const code of p2[action]) {
+        if (taken.has(code)) continue
+        if (this.keysHeld.has(code)) out.held |= bit
+        if (this.keysPending.has(code)) out.pressed |= bit
+      }
+    }
+  }
+
+  /**
    * Two seats can never share one gamepad: if they do (e.g. after a solo game),
    * player 2 falls back to the keyboard. Returns true if something changed.
    */

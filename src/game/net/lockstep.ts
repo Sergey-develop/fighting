@@ -2,6 +2,7 @@ import { TICK_MS } from '../core/config'
 import type { PlayerSlot } from '../core/types'
 import type { InputFrame } from '../input/actions'
 import type { GameMessage, NetMessage } from './connection'
+import { netDiag, sampleTick } from './diag'
 
 /** Input delay bounds, ticks. */
 export const MIN_INPUT_DELAY = 2
@@ -38,6 +39,8 @@ export class Lockstep {
   private readonly remoteSums = new Map<number, number>()
   /** highest tick the opponent sent input for */
   private remoteLatest = -1
+  /** matches whose stray messages were already reported */
+  private readonly reportedStray = new Set<number>()
   desynced = false
 
   constructor(
@@ -49,10 +52,18 @@ export class Lockstep {
   ) {}
 
   receive(m: GameMessage): void {
-    if (m.m !== this.matchId) return
+    if (m.m !== this.matchId) {
+      if (!this.reportedStray.has(m.m)) {
+        this.reportedStray.add(m.m)
+        netDiag('lockstep: ignoring message of another match', { got: m.m, current: this.matchId, type: m.t })
+      }
+      return
+    }
     if (m.t === 'in') {
+      const dup = this.remote.has(m.k)
       this.remote.set(m.k, (m.h & 0xffff) | ((m.p & 0xffff) << 16))
       if (m.k > this.remoteLatest) this.remoteLatest = m.k
+      if (sampleTick(m.k)) netDiag('lockstep: input received', { match: m.m, tick: m.k, held: m.h, pressed: m.p, dup })
     } else {
       this.remoteSums.set(m.k, m.s)
       this.compare(m.k)
@@ -64,6 +75,11 @@ export class Lockstep {
     return tick < this.delay || this.remote.has(tick)
   }
 
+  /** Why tick `tick` can't run yet (for diagnostics). */
+  waitInfo(tick: number): { needTick: number; lastReceivedTick: number; behindBy: number } {
+    return { needTick: tick, lastReceivedTick: this.remoteLatest, behindBy: tick - this.remoteLatest }
+  }
+
   /**
    * Record local input sampled now (applied at tick + delay), send it, and
    * fill both seats' input for `tick`. Call only when ready(tick).
@@ -72,6 +88,7 @@ export class Lockstep {
     const at = tick + this.delay
     this.local.set(at, pack(sampled))
     this.link.send({ t: 'in', m: this.matchId, k: at, h: sampled.held, p: sampled.pressed })
+    if (sampleTick(at)) netDiag('lockstep: input sent', { match: this.matchId, tick: at, held: sampled.held, pressed: sampled.pressed })
     const mine = this.local.get(tick) ?? 0
     const theirs = this.remote.get(tick) ?? 0
     this.local.delete(tick)
@@ -109,7 +126,7 @@ export class Lockstep {
     this.remoteSums.delete(tick)
     if (a !== b && !this.desynced) {
       this.desynced = true
-      console.error(`[online] desync detected at tick ${tick}`)
+      netDiag('lockstep: DESYNC — state checksums differ', { match: this.matchId, tick, local: a, remote: b })
     }
   }
 }

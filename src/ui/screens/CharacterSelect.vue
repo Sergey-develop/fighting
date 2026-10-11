@@ -7,7 +7,7 @@ import { ROSTER, rosterIndexOf } from '@/game/fighters/roster'
 import type { FighterDefinition, FighterProfileText } from '@/game/fighters/types'
 import { hasMenu } from '@/game/input/actions'
 import { inputManager } from '@/game/input/input-manager'
-import { gamepadCodeLabel, keyCodeLabel, type DeviceRef } from '@/game/input/bindings'
+import { gamepadCodeLabel, keyCodeLabel, type DeviceRef, type KeyboardBindings } from '@/game/input/bindings'
 import { net } from '@/game/net/connection'
 import FighterPreview from '../components/FighterPreview.vue'
 import ShapePlate from '../components/ShapePlate.vue'
@@ -263,13 +263,16 @@ function assign(slot: PlayerSlot, device: DeviceRef): void {
 function keysHint(slot: PlayerSlot): string {
   void deviceTick.value
   if (vsAi || (isOnline && slot !== me)) return ''
-  // online every player uses player 1's controls
-  const pc = inputManager.controls.players[isOnline ? 0 : slot]
-  if (pc.device.kind === 'keyboard') {
-    const k = (codes: readonly string[]): string => (codes[0] ? keyCodeLabel(codes[0]) : '—')
-    const kb = pc.keyboard
-    return `${k(kb.left)} ${k(kb.jump)} ${k(kb.right)} · ${k(kb.light)} ${k(kb.heavy)} ${k(kb.kick)} ${k(kb.special)} ${k(kb.block)}`
+  const k = (codes: readonly string[]): string => (codes[0] ? keyCodeLabel(codes[0]) : '—')
+  const keys = (kb: KeyboardBindings): string =>
+    `${k(kb.left)} ${k(kb.jump)} ${k(kb.right)} · ${k(kb.light)} ${k(kb.heavy)} ${k(kb.kick)} ${k(kb.special)} ${k(kb.block)}`
+  // online the local player may use either keyboard set (as currently bound), any gamepad or touch
+  if (isOnline) {
+    const [p1, p2] = inputManager.controls.players
+    return `${keys(p1.keyboard)} или ${keys(p2.keyboard)} · геймпад`
   }
+  const pc = inputManager.controls.players[slot]
+  if (pc.device.kind === 'keyboard') return keys(pc.keyboard)
   if (pc.device.kind === 'gamepad') {
     const g = (codes: readonly number[]): string => (codes[0] !== undefined ? gamepadCodeLabel(codes[0]) : '—')
     const gp = pc.gamepad

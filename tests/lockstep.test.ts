@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it, vi } from 'vitest'
 import { AiController } from '../src/game/ai/ai-controller'
 import { CombatSystem } from '../src/game/combat/combat-system'
 import { Fighter } from '../src/game/combat/fighter'
@@ -65,6 +65,11 @@ class Side {
     this.tick++
   }
 }
+
+beforeAll(() => {
+  // [NET-DIAG] lines are for players' consoles, not for test output
+  vi.spyOn(console, 'info').mockImplementation(() => {})
+})
 
 describe('online lockstep', () => {
   it('picks a bigger input delay for a slower connection', () => {

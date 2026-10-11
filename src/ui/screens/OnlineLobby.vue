@@ -13,7 +13,7 @@ const codeInput = ref('')
 const input = ref<HTMLInputElement | null>(null)
 const copied = ref(false)
 
-const busy = computed(() => online.status === 'opening' || online.status === 'connecting' || online.status === 'waiting')
+const busy = computed(() => ['opening', 'connecting', 'waiting', 'linking'].includes(online.status))
 const canJoin = computed(() => normalizeRoomCode(codeInput.value).length >= 4 && !busy.value)
 
 const statusText = computed(() => {
@@ -24,6 +24,8 @@ const statusText = computed(() => {
       return 'Ждём соперника...'
     case 'connecting':
       return `Подключаемся к комнате ${online.code}...`
+    case 'linking':
+      return 'Соперник найден, проверяем канал связи...'
     case 'connected':
       return 'Соединение установлено!'
     default:
@@ -108,7 +110,7 @@ useMenuInput(({ any }) => {
     <div class="cards">
       <section class="panel card host">
         <h2>Создать комнату</h2>
-        <template v-if="online.role === 'host' && (online.status === 'waiting' || online.status === 'opening')">
+        <template v-if="online.role === 'host' && ['waiting', 'opening', 'linking'].includes(online.status)">
           <p class="label">Код комнаты — отправьте его сопернику:</p>
           <button class="code" :disabled="online.status !== 'waiting'" title="Скопировать" @click="copyCode">
             {{ online.status === 'waiting' ? online.code : '·····' }}
@@ -138,7 +140,7 @@ useMenuInput(({ any }) => {
           @keydown.enter="join"
           @keydown.esc="input?.blur()"
         />
-        <button v-if="online.role === 'guest' && online.status === 'connecting'" class="btn ghost" @click="cancel">
+        <button v-if="online.role === 'guest' && (online.status === 'connecting' || online.status === 'linking')" class="btn ghost" @click="cancel">
           Отмена
         </button>
         <button v-else class="btn pink" :disabled="!canJoin" @click="join">Подключиться</button>
@@ -150,7 +152,7 @@ useMenuInput(({ any }) => {
     <p v-if="busy && online.diag" class="hint small diag">{{ online.diag }}</p>
 
     <p class="hint note">
-      Игра идёт напрямую между браузерами. Оба играют своими кнопками Игрока 1 (или любым геймпадом).
+      Игра идёт напрямую между браузерами или через сервер-ретранслятор. Управление: WASD или стрелки, любой геймпад, на телефоне — кнопки на экране.
     </p>
     <button class="btn ghost back" @click="back">Назад</button>
     <span class="build">сборка {{ BUILD }}</span>

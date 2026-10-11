@@ -8,6 +8,8 @@ import { inputManager } from '@/game/input/input-manager'
 import { net } from '@/game/net/connection'
 import { inputDelayForRtt } from '@/game/net/lockstep'
 import { RELAY_BROKERS } from '@/game/net/transports'
+import { netDiag } from '@/game/net/diag'
+import { MatchGate, type MatchSetup } from '@/game/net/match-gate'
 import {
   controlsRecord,
   defaultStatistics,
@@ -65,8 +67,10 @@ export interface OnlineState {
   /** opponent asked for a rematch on the result screen */
   remoteRematch: boolean
   localRematch: boolean
-  /** serial of the current match, counted the same way on both sides */
+  /** id of the current match: chosen by the host, carried in 'start' */
   matchId: number
+  /** bumps when the opponent reports its fight loaded / failed (see matchGate) */
+  gateSerial: number
   /** input delay of the current match, ticks */
   delay: number
   roundTime: number
@@ -86,6 +90,7 @@ export const online = reactive<OnlineState>({
   remoteRematch: false,
   localRematch: false,
   matchId: 0,
+  gateSerial: 0,
   delay: 3,
   roundTime: 99,
 })
@@ -140,6 +145,7 @@ function syncOnline(): void {
     online.remoteRematch = false
     online.localRematch = false
     online.matchId = 0
+    matchGate.clear()
     app.mode = 'online'
     go('select')
   }
@@ -150,18 +156,35 @@ function syncOnline(): void {
 }
 net.onStatus(syncOnline)
 
+/** Opponent's "fight loaded" reports; FightScreen starts the fight through it. */
+export const matchGate = new MatchGate()
+
+/** The setup this browser is about to play (for the start gate). */
+export function localMatchSetup(): MatchSetup {
+  return {
+    matchId: online.matchId,
+    fighters: [app.selection[0], app.selection[1]],
+    location: app.location,
+    roundTime: online.roundTime,
+    delay: online.delay,
+  }
+}
+
 /** Host: the match is set up — tell the guest and go to the VS screen. */
 export function hostStartMatch(): void {
   const delay = inputDelayForRtt(net.rtt)
   const roundTime = settings.value.roundTimeSeconds
-  net.send({ t: 'start', fighters: [...app.selection], location: app.location, roundTime, delay })
-  beginOnlineMatch(delay, roundTime)
+  const m = online.matchId + 1
+  net.send({ t: 'start', m, fighters: [...app.selection], location: app.location, roundTime, delay })
+  netDiag('host: start sent', { match: m, fighters: app.selection, location: app.location, roundTime, delay })
+  beginOnlineMatch(m, delay, roundTime)
 }
 
-function beginOnlineMatch(delay: number, roundTime: number): void {
+function beginOnlineMatch(matchId: number, delay: number, roundTime: number): void {
   online.delay = delay
   online.roundTime = roundTime
-  online.matchId++
+  online.matchId = matchId
+  matchGate.forgetBefore(matchId)
   online.localRematch = false
   online.remoteRematch = false
   go('versus')
@@ -171,13 +194,13 @@ function beginOnlineMatch(delay: number, roundTime: number): void {
 export function requestRematch(): void {
   if (online.localRematch) return
   online.localRematch = true
-  net.send({ t: 'rematch' })
+  net.send({ t: 'rematch', m: online.matchId })
   if (online.remoteRematch && online.role === 'host') hostStartMatch()
 }
 
 /** Both players back to character select. */
 export function onlineBackToSelect(): void {
-  net.send({ t: 'select' })
+  net.send({ t: 'select', m: online.matchId })
   go('select')
 }
 
@@ -197,14 +220,39 @@ net.onMessage((m) => {
       online.remoteLocation = m.i
       break
     case 'start':
+      // a repeated / stale start must not restart a match
+      if (m.m <= online.matchId) {
+        netDiag('guest: duplicate start ignored', { match: m.m, current: online.matchId })
+        break
+      }
+      netDiag('guest: start received', { match: m.m, fighters: m.fighters, location: m.location, roundTime: m.roundTime, delay: m.delay })
       app.selection = [m.fighters[0], m.fighters[1]]
       app.location = m.location
-      beginOnlineMatch(m.delay, m.roundTime)
+      beginOnlineMatch(m.m, m.delay, m.roundTime)
+      break
+    case 'fightready': {
+      const r = matchGate.remoteReady({ matchId: m.m, fighters: m.fighters, location: m.location, roundTime: m.roundTime, delay: m.delay })
+      netDiag('opponent fight loaded', { match: m.m, result: r })
+      online.gateSerial++
+      break
+    }
+    case 'fightfail':
+      netDiag('opponent fight failed to load', { match: m.m, reason: m.reason })
+      matchGate.remoteFailed(m.m, m.reason)
+      online.gateSerial++
       break
     case 'select':
+      if (m.m !== online.matchId) {
+        netDiag('stale select ignored', { match: m.m, current: online.matchId })
+        break
+      }
       if (app.screen !== 'select') go('select')
       break
     case 'rematch':
+      if (m.m !== online.matchId) {
+        netDiag('stale rematch ignored', { match: m.m, current: online.matchId })
+        break
+      }
       online.remoteRematch = true
       // the host owns the match setup (delay, round time) and starts it
       if (online.localRematch && online.role === 'host') hostStartMatch()

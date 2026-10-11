@@ -10,25 +10,33 @@ import {
   type Transport,
   type TransportEvents,
 } from './transports'
+import { maskCode, maskId, netDiag } from './diag'
+import { Handshake } from './handshake'
 
 /** Bumped whenever the message format changes: both sides must run the same build. */
-export const PROTOCOL_VERSION = 2
+export const PROTOCOL_VERSION = 3
 
 /** Messages exchanged between the two browsers. */
 export type NetMessage =
+  /** link handshake, see handshake.ts */
   | { t: 'hello'; v: number }
+  | { t: 'ready' }
   | { t: 'ping'; at: number }
   | { t: 'pong'; at: number }
   /** character select: cursor position and lock-in of the sender's seat */
   | { t: 'seat'; cursor: number; ready: boolean }
   /** location select: the host's carousel position */
   | { t: 'loc'; i: number }
-  /** host → guest: the match is set up, go to the VS screen */
-  | { t: 'start'; fighters: [string, string]; location: string; roundTime: number; delay: number }
-  /** both sides back to character select */
-  | { t: 'select' }
-  /** the sender wants a rematch */
-  | { t: 'rematch' }
+  /** host → guest: match `m` is set up, go to the VS screen */
+  | { t: 'start'; m: number; fighters: [string, string]; location: string; roundTime: number; delay: number }
+  /** the sender loaded match `m` with this setup (see match-gate.ts) */
+  | { t: 'fightready'; m: number; fighters: [string, string]; location: string; roundTime: number; delay: number }
+  /** the sender could not load match `m` */
+  | { t: 'fightfail'; m: number; reason: string }
+  /** both sides back to character select (after match `m`) */
+  | { t: 'select'; m: number }
+  /** the sender wants a rematch of match `m` */
+  | { t: 'rematch'; m: number }
   /** input of the sender's seat for tick `k` of match `m` */
   | { t: 'in'; m: number; k: number; h: number; p: number }
   /** state checksum after tick `k` of match `m` (desync detection) */
@@ -37,7 +45,11 @@ export type NetMessage =
 
 export type GameMessage = Extract<NetMessage, { t: 'in' | 'sum' }>
 
-export type ConnectionStatus = 'idle' | 'opening' | 'waiting' | 'connecting' | 'connected' | 'closed'
+/**
+ * 'linking': a transport was picked and the handshake is running — the link is
+ * NOT usable yet. 'connected': messages went through in both directions.
+ */
+export type ConnectionStatus = 'idle' | 'opening' | 'waiting' | 'connecting' | 'linking' | 'connected' | 'closed'
 
 export type Role = 'host' | 'guest'
 
@@ -51,8 +63,8 @@ const P2P_GRACE_MS = 4000
 const CONNECT_TIMEOUT_MS = 30000
 /** guest: how long to wait for the host's answer on one relay before trying the next */
 const RELAY_ANSWER_MS = 4000
-/** host: the guest must greet back on the adopted link within this time */
-const HELLO_TIMEOUT_MS = 8000
+/** the handshake on the adopted link must finish within this time */
+const HANDSHAKE_TIMEOUT_MS = 10000
 /** the TURN servers in PeerJS' default config are dead and only slow ICE down */
 const PEER_OPTIONS = {
   debug: 0,
@@ -110,7 +122,9 @@ export class NetConnection {
   private pingTimer = 0
   private connectTimer = 0
   private graceTimer = 0
-  private helloTimer = 0
+  private handshakeTimer = 0
+  private handshake: Handshake | null = null
+  private firstPong = true
   private readonly statusListeners = new Set<() => void>()
   private readonly messageListeners = new Set<(m: NetMessage) => void>()
   /** in-fight traffic that arrived before the fight session subscribed */
@@ -159,6 +173,7 @@ export class NetConnection {
     const alive = (): boolean => this.session === session
     this.role = 'host'
     this.code = randomRoomCode()
+    netDiag('host: creating room', { room: maskCode(this.code), relays: RELAY_BROKERS.length })
     this.setStatus('opening')
 
     // the room is reachable through PeerJS and through every relay that answers
@@ -182,15 +197,18 @@ export class NetConnection {
     }
     peer.on('open', () => {
       if (!alive()) return
+      netDiag('host: peerjs broker open')
       this.p2pReady = true
       opened()
       this.emitStatus()
     })
     peer.on('connection', (c) => {
       if (!alive() || this.transport) {
+        netDiag('host: extra webrtc connection refused', { linked: this.transport?.kind ?? null })
         c.on('open', () => c.close())
         return
       }
+      netDiag('host: incoming webrtc connection')
       const t: Transport = new PeerTransport(c, this.events(session, () => t))
       this.candidates.push(t)
       c.on('open', () => {
@@ -200,6 +218,7 @@ export class NetConnection {
     })
     peer.on('error', (e) => {
       if (!alive()) return
+      netDiag('host: peerjs error', { type: e.type, status: this.status })
       if (e.type === 'unavailable-id' && this.status === 'opening') {
         this.host() // code collision: try another one
         return
@@ -207,10 +226,15 @@ export class NetConnection {
       peerFail()
     })
     peer.on('disconnected', () => {
-      if (alive()) peerFail()
+      // after a relay was picked we close PeerJS ourselves: not a failure
+      if (!alive() || this.transport) return
+      netDiag('host: peerjs broker disconnected', { status: this.status })
+      peerFail()
     })
 
     const inbox = relayTopic(this.code, 'h')
+    /** the host's sender id in relay envelopes */
+    const hostId = Math.random().toString(36).slice(2, 10)
     for (const broker of RELAY_BROKERS) {
       connectRelay(broker)
         .then(async (client) => {
@@ -229,8 +253,10 @@ export class NetConnection {
               return
             }
             if (!isJoin(d)) return
+            netDiag('host: guest knocked through relay', { guest: maskId(d.id) })
             this.listeners = this.listeners.filter((c) => c !== client)
-            const t: Transport = new RelayTransport(client, relayTopic(this.code, `g-${d.id}`), inbox, this.events(session, () => t))
+            // bound to this guest: envelopes from anyone else on the inbox are dropped
+            const t: Transport = new RelayTransport(client, relayTopic(this.code, `g-${d.id}`), inbox, this.events(session, () => t), hostId, d.id)
             this.adopt(t)
           })
           this.relaysReady++
@@ -250,12 +276,14 @@ export class NetConnection {
     const alive = (): boolean => this.session === session
     this.role = 'guest'
     this.code = normalizeRoomCode(rawCode)
+    netDiag('guest: joining room', { room: maskCode(this.code) })
     this.setStatus('connecting')
 
     let relayStarted = false
     const startRelay = (): void => {
       if (relayStarted || !alive() || this.transport) return
       relayStarted = true
+      netDiag('guest: trying relays', { linked: this.transport !== null })
       this.relayTried = true
       this.emitStatus()
       void this.joinRelays(session)
@@ -265,6 +293,7 @@ export class NetConnection {
     this.peer = peer
     peer.on('open', () => {
       if (!alive()) return
+      netDiag('guest: peerjs broker open, opening webrtc to host')
       this.p2pReady = true
       this.emitStatus()
       const c = peer.connect(PEER_PREFIX + this.code, { reliable: true, serialization: 'json' })
@@ -273,10 +302,15 @@ export class NetConnection {
       this.candidates.push(t)
     })
     // PeerJS blocked, or the room is only reachable through a relay
-    peer.on('error', startRelay)
+    peer.on('error', (e) => {
+      if (alive()) netDiag('guest: peerjs error', { type: e.type })
+      startRelay()
+    })
     this.graceTimer = window.setTimeout(startRelay, P2P_GRACE_MS)
     this.connectTimer = window.setTimeout(() => {
-      if (alive() && !this.transport) this.lost('Не удалось подключиться: комната не найдена или соперник недоступен')
+      if (!alive() || this.transport) return
+      netDiag('guest: gave up connecting', { afterMs: CONNECT_TIMEOUT_MS, p2pBroker: this.p2pReady, relaysKnocked: this.relaysReady })
+      this.lost('Не удалось подключиться: комната не найдена или соперник недоступен')
     }, CONNECT_TIMEOUT_MS)
   }
 
@@ -298,7 +332,8 @@ export class NetConnection {
         client.end(true)
         return
       }
-      const t: RelayTransport = new RelayTransport(client, hostInbox, inbox, this.events(session, () => t))
+      // the guest binds to the first sender on its private inbox: the host
+      const t: RelayTransport = new RelayTransport(client, hostInbox, inbox, this.events(session, () => t), id, null)
       this.candidates.push(t)
       try {
         await subscribe(client, inbox)
@@ -308,11 +343,13 @@ export class NetConnection {
       }
       const join: JoinMessage = { t: 'join', id }
       t.sendRaw(join)
+      netDiag('guest: knocked on host through relay', { broker: broker.url.replace(/^wss:\/\//, ''), me: maskId(id) })
       this.relaysReady++
       this.emitStatus()
       // the host answers with 'hello' on this relay (adopted in events)
       await new Promise((r) => window.setTimeout(r, RELAY_ANSWER_MS))
       if (done()) return
+      netDiag('guest: no answer through relay, trying next', { broker: broker.url.replace(/^wss:\/\//, ''), waitedMs: RELAY_ANSWER_MS })
       t.close()
       this.candidates = this.candidates.filter((c) => c !== t)
     }
@@ -327,7 +364,8 @@ export class NetConnection {
   /** Leave the room (tells the other side). */
   leave(): void {
     const t = this.transport
-    if (t && this.connected) {
+    netDiag(`${this.role}: leaving`, { status: this.status })
+    if (t && (this.connected || this.status === 'linking')) {
       const bye: NetMessage = { t: 'bye' }
       t.send(bye)
       this.transport = null
@@ -374,27 +412,45 @@ export class NetConnection {
       this.peer?.destroy()
       this.peer = null
     }
-    this.send({ t: 'hello', v: PROTOCOL_VERSION })
+    netDiag(`${this.role}: transport selected`, { kind: t.kind })
+    this.setStatus('linking')
+    this.handshake = new Handshake(this.role, PROTOCOL_VERSION, (m) => {
+      netDiag(`${this.role}: handshake send`, { msg: m.t })
+      this.send(m)
+    })
+    this.handshake.begin()
     this.send({ t: 'ping', at: performance.now() })
     this.pingTimer = window.setInterval(() => this.send({ t: 'ping', at: performance.now() }), PING_INTERVAL_MS)
-    if (this.role === 'host') {
-      // the guest may have given up on this link already (it moved to another relay)
-      this.helloTimer = window.setTimeout(() => this.lost('Соперник не ответил — создайте комнату заново'), HELLO_TIMEOUT_MS)
-    }
-    this.setStatus('connected')
+    // e.g. the guest already moved on to another relay, or one direction is blocked
+    this.handshakeTimer = window.setTimeout(() => {
+      netDiag(`${this.role}: handshake timed out`, { kind: t.kind, afterMs: HANDSHAKE_TIMEOUT_MS })
+      this.lost('Канал не подтвердился: сообщения не проходят в обе стороны — попробуйте ещё раз')
+    }, HANDSHAKE_TIMEOUT_MS)
   }
 
   private receive(m: NetMessage): void {
     switch (m.t) {
       case 'hello':
-        window.clearTimeout(this.helloTimer)
-        if (m.v !== PROTOCOL_VERSION) this.lost('У соперника другая версия игры — обновите страницу')
+      case 'ready': {
+        const event = this.handshake?.handle(m)
+        netDiag(`${this.role}: handshake receive`, { msg: m.t, event })
+        if (event === 'version-mismatch') this.lost('У соперника другая версия игры — обновите страницу')
+        else if (event === 'connected') {
+          window.clearTimeout(this.handshakeTimer)
+          netDiag(`${this.role}: link verified in both directions`, { kind: this.linkKind })
+          this.setStatus('connected')
+        }
         return
+      }
       case 'ping':
         this.send({ t: 'pong', at: m.at })
         return
       case 'pong': {
         const sample = performance.now() - m.at
+        if (this.firstPong) {
+          this.firstPong = false
+          netDiag(`${this.role}: first ping round trip`, { kind: this.linkKind, rttMs: Math.round(sample) })
+        }
         this.rtt = this.rtt === 0 ? sample : this.rtt * 0.8 + sample * 0.2
         this.emitStatus()
         return
@@ -402,6 +458,13 @@ export class NetConnection {
       case 'bye':
         this.lost('Соперник вышел')
         return
+    }
+    // until the handshake is done the link is not trusted: no game traffic
+    if (this.status !== 'connected') {
+      netDiag(`${this.role}: message before the link was verified dropped`, { msg: m.t, status: this.status })
+      return
+    }
+    switch (m.t) {
       case 'in':
       case 'sum':
         if (this.gameHandler) this.gameHandler(m)
@@ -412,6 +475,7 @@ export class NetConnection {
   }
 
   private lost(reason: string): void {
+    netDiag(`${this.role}: connection lost`, { reason, status: this.status, kind: this.linkKind })
     this.reset()
     this.error = reason
     this.setStatus('closed')
@@ -422,7 +486,9 @@ export class NetConnection {
     window.clearInterval(this.pingTimer)
     window.clearTimeout(this.connectTimer)
     window.clearTimeout(this.graceTimer)
-    window.clearTimeout(this.helloTimer)
+    window.clearTimeout(this.handshakeTimer)
+    this.handshake = null
+    this.firstPong = true
     this.transport?.close()
     this.transport = null
     for (const c of this.candidates) c.close()

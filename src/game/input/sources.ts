@@ -26,6 +26,17 @@ export class AnyDeviceInputSource implements InputSource {
   }
 }
 
+/** Online: the one local player, on any keyboard set, gamepad or touch. */
+export class SoloInputSource implements InputSource {
+  readonly kind = 'device'
+
+  constructor(private readonly manager: InputManager) {}
+
+  readTick(out: InputFrame): void {
+    this.manager.readSoloPlayer(out)
+  }
+}
+
 export class DeviceInputSource implements InputSource {
   readonly kind = 'device'
 

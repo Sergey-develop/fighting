@@ -11,9 +11,10 @@ import { PLAYER_SLOTS, type PlayerSlot } from './core/types'
 import { getFighter, validateFighter } from './fighters/registry'
 import type { NetConnection } from './net/connection'
 import { CHECKSUM_INTERVAL, Lockstep } from './net/lockstep'
+import { netDiag } from './net/diag'
 import { ACTION_BIT, createInputFrame, type InputFrame } from './input/actions'
 import type { InputManager } from './input/input-manager'
-import { AnyDeviceInputSource, DeviceInputSource, type InputSource } from './input/sources'
+import { AnyDeviceInputSource, DeviceInputSource, SoloInputSource, type InputSource } from './input/sources'
 import { FighterFx } from './render/fighter-fx'
 import { Renderer } from './render/renderer'
 import { Match, type MatchPhase } from './rounds/match'
@@ -80,6 +81,9 @@ export class FightSession {
   /** local input sampled for the online lockstep */
   private readonly sampled: InputFrame = createInputFrame()
   private stallFrames = 0
+  /** performance.now() when the current wait for the opponent began (0 = not waiting) */
+  private stallSince = 0
+  private stallReported = 0
   private tick = 0
   private lastPhaseSerial = -1
   private matchEndTicks = 0
@@ -119,8 +123,8 @@ export class FightSession {
     this.sources = this.ai
       ? [new AnyDeviceInputSource(input, 0), this.ai]
       : online
-        ? // online each side plays with player 1's controls (keyboard + any gamepad)
-          [new AnyDeviceInputSource(input, 0), new AnyDeviceInputSource(input, 0)]
+        ? // online the local player drives its seat with any keys / pad / touch (the other seat comes from the network)
+          [new SoloInputSource(input), new SoloInputSource(input)]
         : [new DeviceInputSource(input, 0), new DeviceInputSource(input, 1)]
     if (online && this.lockstep) {
       const ls = this.lockstep
@@ -158,6 +162,43 @@ export class FightSession {
   /** Online: the opponent's input is late and the game is waiting for it. */
   get netWaiting(): boolean {
     return this.stallFrames >= NET_WAIT_FRAMES
+  }
+
+  /** Online: how long the game has been waiting for the opponent's input, ms. */
+  get stallMs(): number {
+    return this.stallSince ? performance.now() - this.stallSince : 0
+  }
+
+  /** Online: the tick the game is stuck on. */
+  get stallTick(): number {
+    return this.tick
+  }
+
+  private trackStall(): void {
+    const ls = this.lockstep
+    if (!ls) return
+    if (ls.ready(this.tick)) {
+      if (this.stallSince && this.stallFrames >= NET_WAIT_FRAMES) {
+        netDiag('lockstep: resumed', { tick: this.tick, waitedMs: Math.round(this.stallMs) })
+      }
+      this.stallFrames = 0
+      this.stallSince = 0
+      this.stallReported = 0
+      return
+    }
+    this.stallFrames++
+    if (!this.stallSince) this.stallSince = performance.now()
+    // report when the wait becomes visible, then every 2 s while it lasts
+    const ms = this.stallMs
+    if (this.stallFrames >= NET_WAIT_FRAMES && ms - this.stallReported >= (this.stallReported ? 2000 : 0)) {
+      this.stallReported = ms || 1
+      netDiag('lockstep: waiting for opponent input', {
+        match: this.setup.online?.matchId,
+        ...ls.waitInfo(this.tick),
+        delay: ls.delay,
+        waitedMs: Math.round(ms),
+      })
+    }
   }
 
   /** Online: state checksums of the two sides differed. */
@@ -203,11 +244,11 @@ export class FightSession {
 
   private beginFrame(): void {
     if (this.lockstep) {
-      this.stallFrames = this.lockstep.ready(this.tick) ? 0 : this.stallFrames + 1
+      this.trackStall()
       // while the menu is open, the Vue pause menu owns input polling
       if (this.userPaused) return
       this.input.poll()
-      this.input.readPlayerAnyDevice(0, this.pauseProbe)
+      this.input.readSoloPlayer(this.pauseProbe)
       if (this.pauseProbe.pressed & ACTION_BIT.pause && !this.finished) this.userPaused = true
       this.updatePause()
       return

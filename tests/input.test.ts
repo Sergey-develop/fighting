@@ -172,3 +172,52 @@ describe('InputManager gamepads', () => {
     expect(f.held & ACTION_BIT.left).toBeTruthy()
   })
 })
+
+describe('online: one local player', () => {
+  // the keyboard handler skips typing into form fields; Node has no DOM classes
+  for (const name of ['HTMLInputElement', 'HTMLSelectElement', 'HTMLTextAreaElement']) {
+    if (!(name in globalThis)) Object.defineProperty(globalThis, name, { value: class {}, configurable: true })
+  }
+  const key = (im: InputManager, code: string, down = true): void => {
+    const handler = (im as unknown as Record<string, (e: unknown) => void>)[down ? 'onKeyDown' : 'onKeyUp']
+    handler?.({ code, target: null, repeat: false, preventDefault() {} })
+  }
+
+  it('both keyboard sets, gamepads and touch drive the same fighter', () => {
+    const im = new InputManager()
+    const f = createInputFrame()
+    key(im, 'ArrowLeft')
+    key(im, 'Numpad1')
+    im.readSoloPlayer(f)
+    expect(f.held & ACTION_BIT.left).toBeTruthy()
+    expect(f.pressed & ACTION_BIT.light).toBeTruthy()
+    im.endTick()
+    key(im, 'ArrowLeft', false)
+    key(im, 'KeyD')
+    im.readSoloPlayer(f)
+    expect(f.held & ACTION_BIT.left).toBe(0)
+    expect(f.held & ACTION_BIT.right).toBeTruthy()
+    key(im, 'KeyD', false)
+    im.setTouch(ACTION_BIT.block, true)
+    const pad = makePad('Xbox Controller (STANDARD GAMEPAD)')
+    pads[0] = pad
+    im.poll()
+    im.poll()
+    press(pad, PAD.X)
+    im.poll()
+    im.readSoloPlayer(f)
+    expect(f.held & ACTION_BIT.block).toBeTruthy()
+    expect(f.pressed & ACTION_BIT.light).toBeTruthy()
+  })
+
+  it('a key bound for both players triggers only player 1 action', () => {
+    const im = new InputManager()
+    // player 2 binds J (player 1's light attack) to kick
+    im.controls.players[1].keyboard.kick = ['KeyJ']
+    const f = createInputFrame()
+    key(im, 'KeyJ')
+    im.readSoloPlayer(f)
+    expect(f.pressed & ACTION_BIT.light).toBeTruthy()
+    expect(f.pressed & ACTION_BIT.kick).toBe(0)
+  })
+})
